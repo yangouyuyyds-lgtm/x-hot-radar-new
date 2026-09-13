@@ -1,394 +1,768 @@
 const http = require("http");
+const https = require("https");
+const { URL } = require("url");
 
 const PORT = process.env.PORT || 3000;
 const APIFY_TOKEN = process.env.APIFY_TOKEN || "";
 
-const ACTOR = "myagizm~x-trends-scraper";
+// 使用支持多地区查询的 Actor
+const ACTOR = "automation-lab~twitter-trends-scraper";
 
+const API_URL =
+  "https://api.apify.com/v2/acts/" +
+  ACTOR +
+  "/run-sync-get-dataset-items";
 
-/* =========================
-   网页
-========================= */
+let chinaLocationCache = null;
+let chinaLocationCacheTime = 0;
 
-const html = `<!DOCTYPE html>
+const CACHE_TIME = 60 * 60 * 1000;
+
+function sendJSON(res, status, data) {
+  const body = JSON.stringify(data);
+
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Access-Control-Allow-Origin": "*",
+    "Cache-Control": "no-store"
+  });
+
+  res.end(body);
+}
+
+function sendHTML(res, html) {
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store"
+  });
+
+  res.end(html);
+}
+
+function callApify(input) {
+  return new Promise((resolve, reject) => {
+    if (!APIFY_TOKEN) {
+      reject(new Error("APIFY_TOKEN 未设置"));
+      return;
+    }
+
+    const url =
+      API_URL +
+      "?token=" +
+      encodeURIComponent(APIFY_TOKEN);
+
+    const parsed = new URL(url);
+
+    const requestData = JSON.stringify(input);
+
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(requestData)
+      }
+    };
+
+    const req = https.request(options, (response) => {
+      let data = "";
+
+      response.on("data", (chunk) => {
+        data += chunk;
+      });
+
+      response.on("end", () => {
+        if (response.statusCode < 200 || response.statusCode >= 300) {
+          reject(
+            new Error(
+              "Apify 返回错误 " +
+                response.statusCode +
+                ": " +
+                data.slice(0, 500)
+            )
+          );
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(data));
+        } catch (error) {
+          reject(
+            new Error(
+              "Apify 返回的不是有效 JSON: " +
+                data.slice(0, 500)
+            )
+          );
+        }
+      });
+    });
+
+    req.on("error", reject);
+
+    req.setTimeout(120000, () => {
+      req.destroy(new Error("Apify 请求超时"));
+    });
+
+    req.write(requestData);
+    req.end();
+  });
+}
+
+/*
+ * 兼容不同 Actor 返回结构
+ */
+function getItems(data) {
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  if (data && Array.isArray(data.items)) {
+    return data.items;
+  }
+
+  if (data && Array.isArray(data.data)) {
+    return data.data;
+  }
+
+  if (data && Array.isArray(data.results)) {
+    return data.results;
+  }
+
+  if (data && Array.isArray(data.locations)) {
+    return data.locations;
+  }
+
+  return [];
+}
+
+/*
+ * 找中国地区
+ *
+ * 不写死 WOEID。
+ * 先让 Actor 自己告诉我们它支持哪些地区。
+ */
+async function findChinaLocation() {
+  const now = Date.now();
+
+  if (
+    chinaLocationCache &&
+    now - chinaLocationCacheTime < CACHE_TIME
+  ) {
+    return chinaLocationCache;
+  }
+
+  const result = await callApify({
+    getAvailableLocations: true
+  });
+
+  const locations = getItems(result);
+
+  if (!locations.length) {
+    throw new Error(
+      "抓取器没有返回可用地区列表"
+    );
+  }
+
+  let china = null;
+
+  for (const item of locations) {
+    const countryCode = String(
+      item.countryCode ||
+        item.country_code ||
+        item.country ||
+        ""
+    ).toUpperCase();
+
+    const countryName = String(
+      item.countryName ||
+        item.country_name ||
+        ""
+    );
+
+    const locationName = String(
+      item.locationName ||
+        item.location_name ||
+        item.name ||
+        ""
+    );
+
+    if (
+      countryCode === "CN" ||
+      /中国|China/i.test(countryName) ||
+      /中国大陆|中国|China/i.test(locationName)
+    ) {
+      china = item;
+      break;
+    }
+  }
+
+  if (!china) {
+    throw new Error(
+      "当前抓取器没有找到中国地区。为了保证数据真实，系统不会把全球中文内容冒充成中国区。"
+    );
+  }
+
+  const woeid =
+    china.locationWoeid ||
+    china.location_woeid ||
+    china.woeid ||
+    china.WOEID ||
+    china.id;
+
+  if (!woeid) {
+    throw new Error(
+      "找到了中国地区，但没有找到该地区的 WOEID。"
+    );
+  }
+
+  chinaLocationCache = {
+    woeid: String(woeid),
+    name:
+      china.locationName ||
+      china.location_name ||
+      china.name ||
+      "中国"
+  };
+
+  chinaLocationCacheTime = now;
+
+  return chinaLocationCache;
+}
+
+/*
+ * 统一处理趋势数据
+ */
+function normalizeTrend(item, index) {
+  const name =
+    item.trend ||
+    item.name ||
+    item.title ||
+    item.query ||
+    "";
+
+  const volume =
+    Number(
+      item.tweetVolume ||
+        item.tweet_volume ||
+        item.volume ||
+        0
+    ) || 0;
+
+  const rank =
+    Number(
+      item.rank ||
+        item.position ||
+        index + 1
+    ) || index + 1;
+
+  const location =
+    item.locationName ||
+    item.location_name ||
+    item.location ||
+    "";
+
+  const url =
+    item.url ||
+    item.queryUrl ||
+    item.query_url ||
+    "";
+
+  return {
+    name: String(name).trim(),
+    volume,
+    rank,
+    location: String(location),
+    url: String(url)
+  };
+}
+
+/*
+ * 判断是否包含中文
+ */
+function hasChinese(text) {
+  return /[\u4e00-\u9fff]/.test(text);
+}
+
+/*
+ * 排除明显的日文/韩文
+ */
+function looksJapaneseOrKorean(text) {
+  // 平假名
+  if (/[\u3040-\u309f]/.test(text)) {
+    return true;
+  }
+
+  // 片假名
+  if (/[\u30a0-\u30ff]/.test(text)) {
+    return true;
+  }
+
+  // 韩文
+  if (/[\uac00-\ud7af]/.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+/*
+ * 排除一些明显不是我们想要的体育/欧美娱乐热点
+ */
+const BLOCK_WORDS = [
+  "NBA",
+  "NFL",
+  "NHL",
+  "MLB",
+  "FIFA",
+  "UFC",
+  "WWE",
+  "Premier League",
+  "Manchester",
+  "Liverpool",
+  "Arsenal",
+  "Chelsea",
+  "Real Madrid",
+  "Barcelona",
+  "Taylor Swift",
+  "Donald Trump",
+  "Elon Musk",
+  "Jeremiah Smith"
+];
+
+function isChineseTrend(text) {
+  if (!text) {
+    return false;
+  }
+
+  if (!hasChinese(text)) {
+    return false;
+  }
+
+  if (looksJapaneseOrKorean(text)) {
+    return false;
+  }
+
+  const lower = text.toLowerCase();
+
+  for (const word of BLOCK_WORDS) {
+    if (lower.includes(word.toLowerCase())) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/*
+ * 中文热点排序
+ */
+function chineseScore(item) {
+  const text = item.name;
+
+  const chineseCount =
+    (text.match(/[\u4e00-\u9fff]/g) || []).length;
+
+  let score = 50;
+
+  score += chineseCount * 4;
+
+  if (item.volume > 100000) {
+    score += 25;
+  } else if (item.volume > 50000) {
+    score += 20;
+  } else if (item.volume > 10000) {
+    score += 15;
+  } else if (item.volume > 1000) {
+    score += 8;
+  }
+
+  score += Math.max(0, 15 - item.rank);
+
+  return Math.min(99, Math.max(50, Math.round(score)));
+}
+
+/*
+ * 内容分类
+ */
+function getTags(name) {
+  const tags = [];
+
+  if (
+    /美女|女生|女孩|小姐姐|女神|穿搭|时尚|裙子|颜值|写真|模特|身材|美妆|护肤/.test(
+      name
+    )
+  ) {
+    tags.push("💄 美女时尚");
+  }
+
+  if (
+    /明星|演员|歌手|综艺|娱乐|艺人|偶像|电影|电视剧/.test(
+      name
+    )
+  ) {
+    tags.push("⭐ 娱乐");
+  }
+
+  if (
+    /电影|电视剧|动漫|动画|综艺|剧/.test(
+      name
+    )
+  ) {
+    tags.push("🎬 影视");
+  }
+
+  if (
+    /游戏|电竞|Steam|王者|原神|英雄联盟|LOL/.test(
+      name
+    )
+  ) {
+    tags.push("🎮 游戏");
+  }
+
+  if (
+    /手机|苹果|华为|小米|科技|AI|人工智能|机器人/.test(
+      name
+    )
+  ) {
+    tags.push("🤖 科技");
+  }
+
+  if (
+    /足球|篮球|网球|体育|比赛|奥运/.test(
+      name
+    )
+  ) {
+    tags.push("🏆 体育");
+  }
+
+  if (!tags.length) {
+    tags.push("🇨🇳 中文");
+  }
+
+  return tags;
+}
+
+/*
+ * 获取中国区趋势
+ */
+async function getChinaTrends() {
+  const china = await findChinaLocation();
+
+  const result = await callApify({
+    locations: [String(china.woeid)],
+    maxTrendsPerLocation: 50
+  });
+
+  const items = getItems(result);
+
+  const trends = items
+    .map((item, index) =>
+      normalizeTrend(item, index)
+    )
+    .filter((item) =>
+      isChineseTrend(item.name)
+    )
+    .map((item) => ({
+      ...item,
+      score: chineseScore(item),
+      tags: getTags(item.name)
+    }))
+    .sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
+      }
+
+      return a.rank - b.rank;
+    })
+    .slice(0, 30);
+
+  return {
+    location: china.name,
+    trends
+  };
+}
+
+/*
+ * 获取其他地区
+ */
+async function getOtherTrends(location) {
+  const result = await callApify({
+    locations: [String(location)],
+    maxTrendsPerLocation: 50
+  });
+
+  const items = getItems(result);
+
+  return {
+    location,
+    trends: items
+      .map((item, index) =>
+        normalizeTrend(item, index)
+      )
+      .filter((item) => item.name)
+      .map((item) => ({
+        ...item,
+        score: chineseScore(item),
+        tags: getTags(item.name)
+      }))
+      .slice(0, 30)
+  };
+}
+
+const HTML = `
+<!DOCTYPE html>
 <html lang="zh-CN">
-
 <head>
-
 <meta charset="UTF-8">
-
 <meta
   name="viewport"
-  content="width=device-width,initial-scale=1"
+  content="width=device-width,initial-scale=1,maximum-scale=1"
 />
 
 <title>X热点起飞雷达</title>
 
 <style>
-
-*{
-  box-sizing:border-box;
+* {
+  box-sizing: border-box;
 }
 
-body{
-  margin:0;
-  background:#f5f7fb;
-  color:#111;
+body {
+  margin: 0;
+  background: #f5f5f7;
+  color: #171717;
   font-family:
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei",
     sans-serif;
 }
 
-.wrap{
-  max-width:760px;
-  margin:auto;
-  padding:18px;
+.header {
+  background: #111;
+  color: white;
+  padding: 22px 18px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
-h1{
-  font-size:30px;
-  margin:8px 0;
+.header h1 {
+  margin: 0;
+  font-size: 24px;
 }
 
-.sub{
-  color:#777;
-  font-size:16px;
-  margin-bottom:18px;
+.header p {
+  margin: 7px 0 0;
+  color: #aaa;
+  font-size: 13px;
 }
 
-.panel{
-  background:#fff;
-  border-radius:20px;
-  padding:16px;
-  margin-bottom:14px;
-  box-shadow:0 3px 15px #0000000d;
+.container {
+  max-width: 760px;
+  margin: auto;
+  padding: 16px;
 }
 
-.row{
-  display:flex;
-  gap:10px;
+.panel {
+  background: white;
+  border-radius: 18px;
+  padding: 16px;
+  margin-bottom: 14px;
+  box-shadow: 0 2px 12px rgba(0,0,0,.05);
 }
 
-select,
-button{
-  height:50px;
-  border-radius:14px;
-  font-size:16px;
+select {
+  width: 100%;
+  border: 1px solid #ddd;
+  background: white;
+  border-radius: 12px;
+  padding: 13px;
+  font-size: 16px;
 }
 
-select{
-  flex:1;
-  background:#fff;
-  border:1px solid #ddd;
-  padding:0 14px;
+button {
+  width: 100%;
+  border: 0;
+  background: #111;
+  color: white;
+  border-radius: 12px;
+  padding: 13px;
+  margin-top: 10px;
+  font-size: 16px;
+  font-weight: 600;
 }
 
-button{
-  min-width:125px;
-  padding:0 16px;
-  border:0;
-  background:#111;
-  color:#fff;
-  font-weight:700;
+.stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
 }
 
-button:active{
-  transform:scale(.98);
+.stat {
+  background: #f5f5f7;
+  border-radius: 12px;
+  padding: 12px;
+  text-align: center;
 }
 
-.stats{
-  display:grid;
-  grid-template-columns:
-    repeat(3,1fr);
-  gap:10px;
+.stat b {
+  display: block;
+  font-size: 22px;
 }
 
-.stat{
-  background:#fff;
-  border-radius:18px;
-  padding:15px 5px;
-  text-align:center;
+.stat span {
+  color: #777;
+  font-size: 12px;
 }
 
-.num{
-  font-size:27px;
-  font-weight:800;
+.item {
+  padding: 16px 0;
+  border-bottom: 1px solid #eee;
 }
 
-.label{
-  color:#888;
-  font-size:12px;
-  margin-top:5px;
+.item:last-child {
+  border-bottom: 0;
 }
 
-.item{
-  padding:17px 0;
-  border-bottom:1px solid #eee;
+.rank {
+  color: #999;
+  font-size: 13px;
 }
 
-.item:last-child{
-  border-bottom:0;
+.name {
+  font-size: 18px;
+  font-weight: 700;
+  margin: 5px 0;
+  word-break: break-word;
 }
 
-.rank{
-  font-size:13px;
-  color:#999;
+.score {
+  display: inline-block;
+  background: #111;
+  color: white;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+  margin-right: 6px;
 }
 
-.score{
-  color:#e65100;
-  font-weight:800;
+.tag {
+  display: inline-block;
+  background: #f0f0f0;
+  border-radius: 8px;
+  padding: 4px 7px;
+  font-size: 12px;
+  margin-right: 4px;
+  margin-top: 5px;
 }
 
-.name{
-  font-size:20px;
-  font-weight:750;
-  margin:7px 0;
-  line-height:1.4;
+.volume {
+  color: #777;
+  font-size: 12px;
+  margin-top: 8px;
 }
 
-.meta{
-  color:#888;
-  font-size:13px;
+.loading {
+  text-align: center;
+  padding: 35px 10px;
+  color: #777;
 }
 
-.tags{
-  margin:7px 0;
+.error {
+  background: #fff0f0;
+  color: #c00;
+  padding: 14px;
+  border-radius: 12px;
+  line-height: 1.6;
 }
 
-.tag{
-  display:inline-block;
-  background:#fff0e8;
-  color:#e65100;
-  border-radius:8px;
-  padding:4px 8px;
-  font-size:12px;
-  margin-right:5px;
+.empty {
+  text-align: center;
+  color: #888;
+  padding: 35px 10px;
 }
-
-.cnTag{
-  background:#fff1f1;
-  color:#d62828;
-}
-
-a{
-  color:#1769e0;
-  text-decoration:none;
-  font-weight:600;
-}
-
-.loading{
-  text-align:center;
-  padding:40px 10px;
-  color:#888;
-}
-
-.error{
-  color:#d33;
-  line-height:1.7;
-}
-
-.empty{
-  text-align:center;
-  padding:40px 10px;
-  color:#888;
-  line-height:1.8;
-}
-
-.notice{
-  background:#f7f7f7;
-  border-radius:14px;
-  padding:12px;
-  color:#777;
-  font-size:13px;
-  line-height:1.6;
-  margin-top:10px;
-}
-
-@media(max-width:500px){
-
-  .wrap{
-    padding:12px;
-  }
-
-  h1{
-    font-size:27px;
-  }
-
-  .row{
-    flex-direction:column;
-  }
-
-  button{
-    width:100%;
-  }
-
-  .stats{
-    gap:6px;
-  }
-
-  .stat{
-    padding:13px 4px;
-  }
-
-  .num{
-    font-size:24px;
-  }
-
-}
-
 </style>
-
 </head>
-
 
 <body>
 
-<div class="wrap">
-
-<h1>🔥 X热点起飞雷达</h1>
-
-<div class="sub">
-实时发现正在升温、值得蹲的 X 热点
+<div class="header">
+  <h1>🔥 X热点起飞雷达</h1>
+  <p>实时发现正在升温的 X 热点</p>
 </div>
 
+<div class="container">
 
-<div class="panel">
+  <div class="panel">
 
-<div class="row">
+    <select id="location">
+      <option value="china">🇨🇳 中国区</option>
+      <option value="1">🌎 全球</option>
+      <option value="23424977">🇺🇸 美国</option>
+      <option value="23424975">🇬🇧 英国</option>
+      <option value="23424856">🇯🇵 日本</option>
+    </select>
 
-<select id="location">
+    <button onclick="loadTrends()">
+      🔍 扫描热点
+    </button>
 
-<option value="china">
-🇨🇳 中文区
-</option>
+  </div>
 
-<option value="1">
-🌎 全球
-</option>
+  <div class="panel">
 
-<option value="23424977">
-🇺🇸 美国
-</option>
+    <div class="stats">
+      <div class="stat">
+        <b id="total">-</b>
+        <span>热点</span>
+      </div>
 
-<option value="23424975">
-🇬🇧 英国
-</option>
+      <div class="stat">
+        <b id="attention">-</b>
+        <span>值得关注</span>
+      </div>
 
-<option value="23424856">
-🇯🇵 日本
-</option>
+      <div class="stat">
+        <b id="time">-</b>
+        <span>更新时间</span>
+      </div>
+    </div>
 
-</select>
+  </div>
 
+  <div class="panel">
 
-<button onclick="scan()">
-立即扫描
-</button>
+    <div id="locationName"
+      style="font-weight:700;margin-bottom:8px;">
+      🇨🇳 中国区
+    </div>
 
-</div>
+    <div id="results">
+      <div class="loading">
+        正在等待扫描...
+      </div>
+    </div>
 
-</div>
-
-
-<div class="stats">
-
-<div class="stat">
-
-<div
-  class="num"
-  id="count"
->
--
-</div>
-
-<div class="label">
-热点数量
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div
-  class="num"
-  id="hot"
->
--
-</div>
-
-<div class="label">
-值得关注
-</div>
+  </div>
 
 </div>
-
-
-<div class="stat">
-
-<div
-  class="num"
-  id="time"
->
--
-</div>
-
-<div class="label">
-更新时间
-</div>
-
-</div>
-
-</div>
-
-
-<div
-  class="panel"
-  style="margin-top:14px"
->
-
-<div
-  id="status"
-  class="loading"
->
-点击「立即扫描」获取中文热点
-</div>
-
-<div id="list"></div>
-
-</div>
-
-
-</div>
-
 
 <script>
+async function loadTrends() {
 
-async function scan(){
+  const results =
+    document.getElementById("results");
 
-  const status =
-    document.getElementById("status");
+  const location =
+    document.getElementById("location").value;
 
-  const list =
-    document.getElementById("list");
+  results.innerHTML =
+    '<div class="loading">🔥 正在扫描 X 热点...</div>';
 
-
-  status.innerHTML =
-    "⏳ 正在扫描中文 X 热点...";
-
-  list.innerHTML = "";
-
-
-  try{
-
-    const location =
-      document.getElementById(
-        "location"
-      ).value;
-
+  try {
 
     const response =
       await fetch(
@@ -396,941 +770,195 @@ async function scan(){
         encodeURIComponent(location)
       );
 
-
     const data =
       await response.json();
 
-
-    if(!response.ok){
-
+    if (!response.ok || data.error) {
       throw new Error(
-        data.error ||
-        "扫描失败"
+        data.error || "请求失败"
       );
-
     }
 
+    const trends =
+      data.trends || [];
 
-    const items =
-      data.items || [];
+    document.getElementById("total")
+      .textContent = trends.length;
 
+    document.getElementById("attention")
+      .textContent =
+      trends.filter(x => x.score >= 80).length;
 
-    document.getElementById(
-      "count"
-    ).textContent =
-      items.length;
-
-
-    document.getElementById(
-      "hot"
-    ).textContent =
-      items.filter(
-        x => x.score >= 75
-      ).length;
-
-
-    document.getElementById(
-      "time"
-    ).textContent =
-      new Date()
-      .toLocaleTimeString(
+    document.getElementById("time")
+      .textContent =
+      new Date().toLocaleTimeString(
         "zh-CN",
         {
-          hour:"2-digit",
-          minute:"2-digit"
+          hour: "2-digit",
+          minute: "2-digit"
         }
       );
 
+    document.getElementById("locationName")
+      .textContent =
+      "📍 " + (data.location || location);
 
-    status.innerHTML = "";
-
-
-    if(!items.length){
-
-      status.innerHTML = `
-
-        <div class="empty">
-
-          暂时没有抓到符合条件的中文热点。
-
-          <br>
-
-          建议过几分钟再扫描一次。
-
-          <div class="notice">
-
-            中文区会自动排除纯英文、
-            纯日文以及其他非中文趋势。
-
-          </div>
-
-        </div>
-
-      `;
+    if (!trends.length) {
+      results.innerHTML =
+        '<div class="empty">' +
+        '暂时没有符合条件的热点' +
+        '</div>';
 
       return;
-
     }
 
+    results.innerHTML =
+      trends.map((item, index) => {
 
-    list.innerHTML =
-      items.map(
-        x => {
-
-          const volume =
-            x.tweetVolume
-            ? Number(
-                x.tweetVolume
-              ).toLocaleString()
-            : "暂无";
-
-
-          const tags =
-            (x.tags || [])
-            .map(
-              tag =>
-                '<span class="tag">' +
-                escapeHtml(tag) +
-                '</span>'
+        const tags =
+          (item.tags || [])
+            .map(tag =>
+              '<span class="tag">' +
+              escapeHTML(tag) +
+              '</span>'
             )
             .join("");
 
+        return (
+          '<div class="item">' +
 
-          return `
+          '<div class="rank">' +
+          '#' + (index + 1) +
+          '</div>' +
 
-          <div class="item">
+          '<div class="name">' +
+          escapeHTML(item.name) +
+          '</div>' +
 
-            <div class="rank">
+          '<div>' +
 
-              #${x.rank}
+          '<span class="score">' +
+          '起飞指数 ' +
+          item.score +
+          '</span>' +
 
-              <span class="score">
-                🔥 起飞指数 ${x.score}
-              </span>
+          tags +
 
-            </div>
+          '</div>' +
 
+          '<div class="volume">' +
+          (
+            item.volume
+              ? "讨论量： " +
+                Number(item.volume).toLocaleString()
+              : "正在快速升温"
+          ) +
+          '</div>' +
 
-            <div class="name">
+          '</div>'
+        );
 
-              ${escapeHtml(x.name)}
+      }).join("");
 
-            </div>
+  } catch (error) {
 
-
-            <div class="tags">
-
-              <span class="tag cnTag">
-                🇨🇳 中文热点
-              </span>
-
-              ${tags}
-
-            </div>
-
-
-            <div class="meta">
-
-              讨论量：
-              ${volume}
-
-            </div>
-
-
-            <div style="margin-top:9px">
-
-              <a
-                href="${x.url}"
-                target="_blank"
-              >
-                在 X 查看 →
-              </a>
-
-            </div>
-
-          </div>
-
-          `;
-
-        }
-      ).join("");
-
-
-  }catch(error){
-
-    status.innerHTML =
+    results.innerHTML =
       '<div class="error">' +
-
-      '❌ ' +
-
-      escapeHtml(
-        error.message
-      ) +
-
+      '<b>扫描失败</b><br><br>' +
+      escapeHTML(error.message) +
       '<br><br>' +
-
-      '请检查 Render 中的 APIFY_TOKEN 是否正常。' +
-
+      '如果这是第一次扫描中国区，可能需要等待抓取器完成地区检测。' +
       '</div>';
 
   }
+}
+
+function escapeHTML(value) {
+
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 
 }
 
-
-function escapeHtml(text){
-
-  return String(text || "")
-    .replace(
-      /[&<>"']/g,
-      function(m){
-
-        return {
-
-          "&":"&amp;",
-          "<":"&lt;",
-          ">":"&gt;",
-          '"':"&quot;",
-          "'":"&#039;"
-
-        }[m];
-
-      }
-    );
-
-}
-
+loadTrends();
 </script>
 
 </body>
-
-</html>`;
-
-
-/* =========================
-   中文判断
-========================= */
-
-
-/*
-  中文 Unicode 范围
-*/
-function hasChinese(text){
-
-  return /[\u4e00-\u9fff]/.test(
-    String(text || "")
-  );
-
-}
-
-
-/*
-  判断是不是明显的日文
-*/
-function hasJapanese(text){
-
-  return /[\u3040-\u30ff]/.test(
-    String(text || "")
-  );
-
-}
-
-
-/*
-  判断是否包含韩文
-*/
-function hasKorean(text){
-
-  return /[\uac00-\ud7af]/.test(
-    String(text || "")
-  );
-
-}
-
-
-/*
-  中文热点严格过滤
-*/
-function isChineseTrend(item){
-
-  const name =
-    String(
-      item.name ||
-      item.query ||
-      ""
-    ).trim();
-
-
-  if(!name){
-
-    return false;
-
-  }
-
-
-  /*
-    必须有中文
-  */
-  if(!hasChinese(name)){
-
-    return false;
-
-  }
-
-
-  /*
-    有明显日文假名
-    直接排除
-  */
-  if(hasJapanese(name)){
-
-    return false;
-
-  }
-
-
-  /*
-    韩文直接排除
-  */
-  if(hasKorean(name)){
-
-    return false;
-
-  }
-
-
-  /*
-    一些常见英文体育/人物趋势
-    即使混有其他字符，也排除
-  */
-  const badWords = [
-
-    "NBA",
-    "NFL",
-    "NHL",
-    "MLB",
-    "FIFA",
-    "WWE",
-    "UFC",
-
-    "Jeremiah Smith",
-    "Taylor Swift",
-    "Donald Trump",
-    "Elon Musk",
-
-    "Manchester",
-    "Liverpool",
-    "Arsenal",
-    "Chelsea",
-    "Real Madrid",
-    "Barcelona"
-
-  ];
-
-
-  const lower =
-    name.toLowerCase();
-
-
-  for(
-    const word of badWords
-  ){
-
-    if(
-      lower.includes(
-        word.toLowerCase()
-      )
-    ){
-
-      return false;
-
-    }
-
-  }
-
-
-  return true;
-
-}
-
-
-/* =========================
-   中文分类
-========================= */
-
-function getTags(name){
-
-  const text =
-    String(name || "");
-
-
-  const tags = [];
-
-
-  if(
-    /美女|女神|写真|模特|穿搭|时尚|美妆|颜值|身材|小姐姐|网红/
-    .test(text)
-  ){
-
-    tags.push("💄 美女时尚");
-
-  }
-
-
-  if(
-    /明星|演员|歌手|艺人|娱乐|综艺|偶像|八卦/
-    .test(text)
-  ){
-
-    tags.push("⭐ 明星娱乐");
-
-  }
-
-
-  if(
-    /电影|电视剧|影视|动漫|综艺|剧/
-    .test(text)
-  ){
-
-    tags.push("🎬 影视");
-
-  }
-
-
-  if(
-    /游戏|电竞|手游|LOL|王者|原神|Steam|Switch/
-    .test(text)
-  ){
-
-    tags.push("🎮 游戏");
-
-  }
-
-
-  if(
-    /抖音|微博|小红书|直播|网红|社交/
-    .test(text)
-  ){
-
-    tags.push("📱 社交");
-
-  }
-
-
-  if(
-    /AI|人工智能|科技|手机|苹果|华为|芯片|机器人/
-    .test(text)
-  ){
-
-    tags.push("🤖 科技");
-
-  }
-
-
-  if(
-    /足球|篮球|网球|体育|奥运|世界杯/
-    .test(text)
-  ){
-
-    tags.push("🏆 体育");
-
-  }
-
-
-  if(
-    /中国|大陆|台湾|香港|澳门|深圳|上海|北京|广州|杭州|成都|重庆/
-    .test(text)
-  ){
-
-    tags.push("🇨🇳 中文");
-
-  }
-
-
-  /*
-    如果没有其他分类
-  */
-  if(tags.length === 0){
-
-    tags.push("🔥 中文热点");
-
-  }
-
-
-  return tags.slice(0,2);
-
-}
-
-
-/* =========================
-   起飞指数
-========================= */
-
-function getScore(item){
-
-  const rank =
-    Number(item.rank) || 50;
-
-
-  let score =
-    100 -
-    Math.min(
-      rank * 2,
-      50
-    );
-
-
-  if(item.tweetVolume){
-
-    const volume =
-      Number(
-        item.tweetVolume
-      );
-
-
-    if(volume >= 100000){
-
-      score += 20;
-
-    }else if(
-      volume >= 50000
-    ){
-
-      score += 15;
-
-    }else if(
-      volume >= 10000
-    ){
-
-      score += 10;
-
-    }else if(
-      volume >= 1000
-    ){
-
-      score += 5;
-
-    }
-
-  }
-
-
-  return Math.min(
-    100,
-    Math.max(
-      50,
-      score
-    )
-  );
-
-}
-
-
-/* =========================
-   Apify
-========================= */
-
-async function getTrends(
-  woeid = 1
-){
-
-  if(!APIFY_TOKEN){
-
-    throw new Error(
-      "APIFY_TOKEN 未配置"
-    );
-
-  }
-
-
-  const url =
-    "https://api.apify.com/v2/acts/" +
-    encodeURIComponent(
-      ACTOR
-    ) +
-    "/run-sync-get-dataset-items" +
-    "?token=" +
-    encodeURIComponent(
-      APIFY_TOKEN
-    );
-
-
-  const response =
-    await fetch(
-      url,
-      {
-        method:"POST",
-
-        headers:{
-          "Content-Type":
-            "application/json"
-        },
-
-        body:JSON.stringify({
-
-          woeid:Number(
-            woeid
-          ),
-
-          resultsLimit:50
-
-        })
-
-      }
-    );
-
-
-  const text =
-    await response.text();
-
-
-  if(!response.ok){
-
-    throw new Error(
-      "Apify 请求失败：" +
-      text.slice(0,300)
-    );
-
-  }
-
-
-  try{
-
-    return JSON.parse(
-      text
-    );
-
-  }catch(error){
-
-    throw new Error(
-      "Apify 返回的数据无法解析"
-    );
-
-  }
-
-}
-
-
-/* =========================
-   处理数据
-========================= */
-
-function normalizeItem(
-  item,
-  index
-){
-
-  const name =
-    String(
-      item.name ||
-      item.query ||
-      ""
-    ).trim();
-
-
-  const url =
-    item.url ||
-    (
-      "https://x.com/search?q=" +
-      encodeURIComponent(
-        item.query ||
-        name
-      )
-    );
-
-
-  return {
-
-    rank:
-      Number(
-        item.rank
-      ) ||
-      index + 1,
-
-    name:name,
-
-    query:
-      item.query ||
-      name,
-
-    url:url,
-
-    tweetVolume:
-      item.tweetVolume ||
-      null,
-
-    score:
-      getScore(item),
-
-    tags:
-      getTags(name)
-
-  };
-
-}
-
-
-/* =========================
-   HTTP服务器
-========================= */
-
-const server =
-  http.createServer(
-    async(req,res)=>{
-
-      try{
-
-        const u =
-          new URL(
-            req.url,
-            "http://localhost"
-          );
-
-
-        /* 首页 */
-
-        if(
-          u.pathname === "/" ||
-          u.pathname === "/index.html"
-        ){
-
-          res.writeHead(
-            200,
-            {
-              "Content-Type":
-                "text/html; charset=utf-8"
-            }
-          );
-
-          res.end(
-            html
-          );
-
-          return;
-
-        }
-
-
-        /* 热点API */
-
-        if(
-          u.pathname ===
-          "/api/trends"
-        ){
-
-          const location =
-            u.searchParams.get(
-              "location"
-            ) ||
-            "china";
-
-
-          /*
-            中文区
-          */
-          if(
-            location === "china"
-          ){
-
-            /*
-              全球50条
-            */
-            const global =
-              await getTrends(1);
-
-
-            /*
-              严格中文过滤
-            */
-            let items =
-              global
-              .map(
-                normalizeItem
-              )
-              .filter(
-                isChineseTrend
-              );
-
-
-            /*
-              中文热点优先排序：
-
-              1. 中文程度
-              2. 起飞指数
-              3. 原始排名
-            */
-
-            items.sort(
-              (a,b)=>{
-
-                const aChinese =
-                  (
-                    a.name.match(
-                      /[\u4e00-\u9fff]/g
-                    ) || []
-                  ).length;
-
-
-                const bChinese =
-                  (
-                    b.name.match(
-                      /[\u4e00-\u9fff]/g
-                    ) || []
-                  ).length;
-
-
-                if(
-                  bChinese !==
-                  aChinese
-                ){
-
-                  return (
-                    bChinese -
-                    aChinese
-                  );
-
-                }
-
-
-                if(
-                  b.score !==
-                  a.score
-                ){
-
-                  return (
-                    b.score -
-                    a.score
-                  );
-
-                }
-
-
-                return (
-                  a.rank -
-                  b.rank
-                );
-
-              }
-            );
-
-
-            /*
-              最多显示30条
-            */
-            items =
-              items.slice(
-                0,
-                30
-              );
-
-
-            res.writeHead(
-              200,
-              {
-                "Content-Type":
-                  "application/json; charset=utf-8"
-              }
-            );
-
-
-            res.end(
-              JSON.stringify({
-                items:items,
-                mode:"中文区"
-              })
-            );
-
-
-            return;
-
-          }
-
-
-          /*
-            全球/美国/英国/日本
-          */
-
-          const raw =
-            await getTrends(
-              location
-            );
-
-
-          const items =
-            raw
-            .map(
-              normalizeItem
-            );
-
-
-          res.writeHead(
-            200,
-            {
-              "Content-Type":
-                "application/json; charset=utf-8"
-            }
-          );
-
-
-          res.end(
-            JSON.stringify({
-              items:items,
-              mode:"地区热点"
-            })
-          );
-
-
-          return;
-
-        }
-
-
-        /* 404 */
-
-        res.writeHead(
-          404,
-          {
-            "Content-Type":
-              "text/plain; charset=utf-8"
-          }
+</html>
+`;
+
+const server = http.createServer(
+  async (req, res) => {
+
+    try {
+
+      const parsed =
+        new URL(
+          req.url,
+          "http://" +
+          (req.headers.host || "localhost")
         );
 
-        res.end(
-          "Not found"
-        );
-
-
-      }catch(error){
-
-        res.writeHead(
-          500,
-          {
-            "Content-Type":
-              "application/json; charset=utf-8"
-          }
-        );
-
-
-        res.end(
-          JSON.stringify({
-            error:
-              error.message
-          })
-        );
-
+      if (parsed.pathname === "/") {
+        sendHTML(res, HTML);
+        return;
       }
 
+      if (parsed.pathname === "/health") {
+        sendJSON(res, 200, {
+          ok: true,
+          service: "x-hot-radar"
+        });
+        return;
+      }
+
+      if (parsed.pathname === "/api/trends") {
+
+        const location =
+          parsed.searchParams.get("location") ||
+          "china";
+
+        let data;
+
+        if (location === "china") {
+          data = await getChinaTrends();
+        } else {
+          data = await getOtherTrends(location);
+        }
+
+        sendJSON(res, 200, data);
+        return;
+      }
+
+      sendJSON(res, 404, {
+        error: "Not Found"
+      });
+
+    } catch (error) {
+
+      console.error(error);
+
+      sendJSON(res, 500, {
+        error:
+          error && error.message
+            ? error.message
+            : "服务器错误"
+      });
+
     }
-  );
 
-
-server.listen(
-  PORT,
-  "0.0.0.0",
-  ()=>{
-    console.log(
-      "X热点起飞雷达运行中，端口：" +
-      PORT
-    );
   }
 );
+
+server.listen(PORT, "0.0.0.0", () => {
+
+  console.log(
+    "X热点起飞雷达已启动，端口：" +
+    PORT
+  );
+
+});
