@@ -1,0 +1,12 @@
+{
+  "name": "x-hot-radar-new",
+  "version": "1.0.0",
+  "description": "X热点起飞雷达",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
