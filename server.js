@@ -1,633 +1,561 @@
 const http = require("http");
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
 const ACTOR_ID = "atomus~twitter-scraper";
 
-
-// ==========================
-// 调用 Apify
-// ==========================
-
-async function callApify(input) {
-  if (!APIFY_TOKEN) {
-    throw new Error("APIFY_TOKEN 未配置");
-  }
-
-  const url =
-    "https://api.apify.com/v2/acts/" +
-    ACTOR_ID +
-    "/run-sync-get-dataset-items?token=" +
-    encodeURIComponent(APIFY_TOKEN);
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(input)
+function send(res, status, data, type = "application/json") {
+  res.writeHead(status, {
+    "Content-Type": type + "; charset=utf-8",
+    "Cache-Control": "no-store"
   });
 
-  const text = await response.text();
+  if (type === "application/json") {
+    res.end(JSON.stringify(data));
+  } else {
+    res.end(data);
+  }
+}
 
-  if (!response.ok) {
-    throw new Error(
-      "Apify HTTP " +
-      response.status +
-      ": " +
-      text.substring(0, 500)
+function callApify(input) {
+  return new Promise((resolve, reject) => {
+    if (!APIFY_TOKEN) {
+      return reject(new Error("Render 没有找到 APIFY_TOKEN"));
+    }
+
+    const url =
+      "https://api.apify.com/v2/acts/" +
+      ACTOR_ID +
+      "/run-sync-get-dataset-items?token=" +
+      encodeURIComponent(APIFY_TOKEN);
+
+    const body = JSON.stringify(input);
+
+    const req = require("https").request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body)
+        },
+        timeout: 90000
+      },
+      (res) => {
+        let data = "";
+
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+
+        res.on("end", () => {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            reject(
+              new Error(
+                "Apify HTTP " +
+                  res.statusCode +
+                  "：" +
+                  data.slice(0, 800)
+              )
+            );
+            return;
+          }
+
+          try {
+            resolve(JSON.parse(data));
+          } catch (e) {
+            reject(
+              new Error(
+                "Apify 返回的数据不是 JSON：" +
+                  data.slice(0, 500)
+              )
+            );
+          }
+        });
+      }
     );
-  }
 
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error("Apify 返回的数据无法解析");
-  }
-}
-
-
-// ==========================
-// 中文判断
-// ==========================
-
-function containsChinese(text) {
-  return /[\u3400-\u9fff]/.test(text || "");
-}
-
-
-// ==========================
-// 提取 Hashtag
-// ==========================
-
-function getHashtags(tweet) {
-  const result = [];
-
-  const text = tweet.text || "";
-
-  const matches =
-    text.match(/#[\u3400-\u9fffA-Za-z0-9_]+/g) || [];
-
-  for (const item of matches) {
-    result.push(item);
-  }
-
-  if (Array.isArray(tweet.hashtags)) {
-    for (const item of tweet.hashtags) {
-      if (typeof item === "string") {
-        const tag =
-          item.startsWith("#")
-            ? item
-            : "#" + item;
-
-        result.push(tag);
-      }
-    }
-  }
-
-  return [...new Set(result)];
-}
-
-
-// ==========================
-// 计算帖子热度
-// ==========================
-
-function getEngagement(tweet) {
-  const likes =
-    Number(tweet.favorite_count || 0);
-
-  const retweets =
-    Number(tweet.retweet_count || 0);
-
-  const replies =
-    Number(tweet.reply_count || 0);
-
-  const quotes =
-    Number(tweet.quote_count || 0);
-
-  const views =
-    Number(tweet.view_count || 0);
-
-  return (
-    likes +
-    retweets * 3 +
-    replies * 2 +
-    quotes * 3 +
-    Math.sqrt(Math.max(views, 0)) * 0.5
-  );
-}
-
-
-// ==========================
-// 热点聚合
-// ==========================
-
-function buildTopics(tweets) {
-  const map = new Map();
-
-  for (const tweet of tweets) {
-    const text = tweet.text || "";
-
-    if (!containsChinese(text)) {
-      continue;
-    }
-
-    const hashtags = getHashtags(tweet);
-
-    if (hashtags.length === 0) {
-      continue;
-    }
-
-    const engagement =
-      getEngagement(tweet);
-
-    for (const tag of hashtags) {
-      if (!containsChinese(tag)) {
-        continue;
-      }
-
-      if (!map.has(tag)) {
-        map.set(tag, {
-          name: tag,
-          posts: 0,
-          engagement: 0,
-          authors: new Set(),
-          examples: []
-        });
-      }
-
-      const item = map.get(tag);
-
-      item.posts += 1;
-      item.engagement += engagement;
-
-      if (
-        tweet.author &&
-        tweet.author.screen_name
-      ) {
-        item.authors.add(
-          tweet.author.screen_name
-        );
-      }
-
-      if (item.examples.length < 2) {
-        item.examples.push({
-          text: text.substring(0, 180),
-          url: tweet.url || ""
-        });
-      }
-    }
-  }
-
-
-  const topics = [];
-
-  for (const item of map.values()) {
-    const postScore =
-      Math.log10(item.posts + 1) * 25;
-
-    const engagementScore =
-      Math.log10(item.engagement + 10) * 15;
-
-    const authorScore =
-      Math.log10(item.authors.size + 1) * 10;
-
-    let score =
-      postScore +
-      engagementScore +
-      authorScore;
-
-    score =
-      Math.min(
-        100,
-        Math.round(score)
-      );
-
-    topics.push({
-      name: item.name,
-
-      score: score,
-
-      posts: item.posts,
-
-      authors: item.authors.size,
-
-      examples: item.examples
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error("Apify 请求超过 90 秒，可能正在忙"));
     });
-  }
 
+    req.on("error", (err) => {
+      reject(new Error("连接 Apify 失败：" + err.message));
+    });
 
-  topics.sort(
-    (a, b) => b.score - a.score
-  );
-
-  return topics.slice(0, 30);
+    req.write(body);
+    req.end();
+  });
 }
 
+function cleanText(text) {
+  return String(text || "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-// ==========================
-// 扫描中文热点
-// ==========================
+function isChinese(text) {
+  const s = cleanText(text);
 
-async function scan() {
+  if (!s) return false;
 
+  const chinese = (s.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latin = (s.match(/[A-Za-z]/g) || []).length;
+
+  return chinese >= 2 && chinese >= latin;
+}
+
+function extractHashtags(text) {
+  const matches = String(text || "").match(/#[\w\u4e00-\u9fff]+/g) || [];
+
+  return matches
+    .map((x) => x.trim())
+    .filter((x) => x.length >= 2)
+    .slice(0, 10);
+}
+
+function getNumber(obj, keys) {
+  for (const key of keys) {
+    const n = Number(obj && obj[key]);
+    if (Number.isFinite(n)) return n;
+  }
+
+  return 0;
+}
+
+async function scanChina() {
   const queries = [
     "lang:zh",
     "lang:zh #美女",
     "lang:zh #穿搭",
     "lang:zh #娱乐",
     "lang:zh #明星",
-    "lang:zh #AI",
-    "lang:zh #科技"
+    "lang:zh #科技",
+    "lang:zh #AI"
   ];
 
-  let allTweets = [];
+  const all = [];
 
   for (const query of queries) {
-
-    console.log(
-      "正在搜索:",
-      query
-    );
-
     try {
+      const rows = await callApify({
+        searchType: "search",
+        searchQuery: query,
+        sortOrder: "Latest",
+        language: "zh",
+        maxItems: 30,
+        excludeRetweets: true
+      });
 
-      const result =
-        await callApify({
-          searchType: "search",
-
-          searchQuery: query,
-
-          sortOrder: "Latest",
-
-          language: "zh",
-
-          maxItems: 30,
-
-          excludeRetweets: true
-        });
-
-
-      if (Array.isArray(result)) {
-        allTweets =
-          allTweets.concat(result);
+      if (Array.isArray(rows)) {
+        all.push(...rows);
       }
-
-    } catch (error) {
-
-      console.error(
-        "查询失败:",
-        query,
-        error.message
-      );
-
+    } catch (err) {
+      console.log("查询失败:", query, err.message);
     }
   }
 
+  const chinesePosts = all.filter((item) => {
+    const text =
+      item.text ||
+      item.full_text ||
+      item.content ||
+      "";
 
-  if (allTweets.length === 0) {
-    throw new Error(
-      "没有获取到 X 中文帖子"
-    );
+    return isChinese(text);
+  });
+
+  const topics = {};
+
+  for (const item of chinesePosts) {
+    const text =
+      item.text ||
+      item.full_text ||
+      item.content ||
+      "";
+
+    const hashtags = extractHashtags(text);
+
+    const likes = getNumber(item, [
+      "favorite_count",
+      "like_count",
+      "likes"
+    ]);
+
+    const reposts = getNumber(item, [
+      "retweet_count",
+      "reposts",
+      "repost_count"
+    ]);
+
+    const replies = getNumber(item, [
+      "reply_count",
+      "replies"
+    ]);
+
+    const views = getNumber(item, [
+      "view_count",
+      "views"
+    ]);
+
+    const engagement =
+      likes +
+      reposts * 3 +
+      replies * 2 +
+      Math.min(views / 100, 5000);
+
+    for (const tag of hashtags) {
+      if (!topics[tag]) {
+        topics[tag] = {
+          topic: tag,
+          posts: 0,
+          engagement: 0,
+          authors: new Set()
+        };
+      }
+
+      topics[tag].posts += 1;
+      topics[tag].engagement += engagement;
+
+      const author =
+        item.author?.username ||
+        item.username ||
+        item.author_username ||
+        "";
+
+      if (author) {
+        topics[tag].authors.add(author);
+      }
+    }
   }
 
+  const result = Object.values(topics)
+    .map((item) => {
+      const authors = item.authors.size;
 
-  const topics =
-    buildTopics(allTweets);
+      const score = Math.min(
+        99,
+        Math.round(
+          item.posts * 8 +
+          Math.log10(item.engagement + 1) * 15 +
+          authors * 2
+        )
+      );
 
+      return {
+        topic: item.topic,
+        score,
+        posts: item.posts,
+        authors,
+        engagement: Math.round(item.engagement)
+      };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 30);
 
   return {
     success: true,
-
-    region: "中文热点",
-
-    scannedTweets:
-      allTweets.length,
-
-    scanTime:
-      new Date().toISOString(),
-
-    data:
-      topics
+    scannedPosts: chinesePosts.length,
+    topics: result,
+    scannedAt: new Date().toISOString()
   };
 }
 
-
-// ==========================
-// HTML
-// ==========================
-
-function getHTML() {
-
-  return [
-    "<!DOCTYPE html>",
-    "<html lang='zh-CN'>",
-    "<head>",
-    "<meta charset='UTF-8'>",
-
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>",
-
-    "<title>X热点起飞雷达</title>",
-
-    "<style>",
-
-    "body{",
-    "margin:0;",
-    "background:#080808;",
-    "color:#fff;",
-    "font-family:-apple-system,BlinkMacSystemFont,Arial;",
-    "}",
-
-    ".box{",
-    "max-width:700px;",
-    "margin:auto;",
-    "padding:20px;",
-    "}",
-
-    "h1{",
-    "font-size:26px;",
-    "margin-bottom:5px;",
-    "}",
-
-    ".sub{",
-    "color:#888;",
-    "font-size:14px;",
-    "margin-bottom:20px;",
-    "}",
-
-    "button{",
-    "width:100%;",
-    "padding:15px;",
-    "border:0;",
-    "border-radius:12px;",
-    "font-size:16px;",
-    "font-weight:bold;",
-    "}",
-
-    ".status{",
-    "margin:15px 0;",
-    "color:#999;",
-    "font-size:13px;",
-    "}",
-
-    ".card{",
-    "background:#151515;",
-    "border:1px solid #292929;",
-    "border-radius:15px;",
-    "padding:15px;",
-    "margin-bottom:10px;",
-    "}",
-
-    ".rank{",
-    "color:#777;",
-    "font-size:12px;",
-    "}",
-
-    ".name{",
-    "font-size:18px;",
-    "font-weight:bold;",
-    "margin:7px 0;",
-    "}",
-
-    ".score{",
-    "font-size:14px;",
-    "color:#aaa;",
-    "}",
-
-    ".flight{",
-    "font-size:20px;",
-    "font-weight:bold;",
-    "color:#fff;",
-    "}",
-
-    ".example{",
-    "margin-top:10px;",
-    "color:#888;",
-    "font-size:12px;",
-    "line-height:1.5;",
-    "}",
-
-    "a{",
-    "color:#aaa;",
-    "}",
-
-    "</style>",
-
-    "</head>",
-
-    "<body>",
-
-    "<div class='box'>",
-
-    "<h1>🚀 X热点起飞雷达</h1>",
-
-    "<div class='sub'>中文 X 热点实时聚合</div>",
-
-    "<button id='btn' onclick='scan()'>🔥 立即扫描热点</button>",
-
-    "<div id='status' class='status'>等待扫描</div>",
-
-    "<div id='list'></div>",
-
-    "</div>",
-
-
-    "<script>",
-
-    "async function scan(){",
-
-    "const btn=document.getElementById('btn');",
-
-    "const status=document.getElementById('status');",
-
-    "const list=document.getElementById('list');",
-
-    "btn.disabled=true;",
-
-    "btn.innerText='⏳ 正在扫描...';",
-
-    "status.innerText='正在获取 X 中文公开内容';",
-
-    "list.innerHTML='';",
-
-
-    "try{",
-
-    "const response=await fetch('/api/scan');",
-
-    "const data=await response.json();",
-
-    "if(!response.ok || !data.success){",
-
-    "throw new Error(data.error || '扫描失败');",
-
-    "}",
-
-
-    "status.innerText='扫描完成：'+data.scannedTweets+' 条帖子';",
-
-
-    "data.data.forEach(function(item,index){",
-
-    "const card=document.createElement('div');",
-
-    "card.className='card';",
-
-
-    "let example='';",
-
-    "if(item.examples && item.examples.length){",
-
-    "example='<div class=\"example\">'+",
-    "escapeHTML(item.examples[0].text)+",
-    "'</div>';",
-
-    "}",
-
-
-    "card.innerHTML=",
-    "'<div class=\"rank\">#'+",
-    "(index+1)+",
-    "'</div>'+",
-
-    "'<div class=\"name\">'+",
-    "escapeHTML(item.name)+",
-    "'</div>'+",
-
-    "'<div class=\"score\">'+",
-    "item.posts+' 条相关帖子 · '+",
-    "item.authors+' 位作者</div>'+",
-
-    "'<div class=\"flight\">🚀 热度 '+",
-    "item.score+",
-    "</div>'+",
-
-    "example;",
-
-
-    "list.appendChild(card);",
-
-    "});",
-
-
-    "}catch(error){",
-
-    "status.innerText='❌ '+error.message;",
-
-    "}finally{",
-
-    "btn.disabled=false;",
-
-    "btn.innerText='🔥 再次扫描热点';",
-
-    "}",
-
-    "}",
-
-
-    "function escapeHTML(text){",
-
-    "return String(text||'')",
-    ".replace(/&/g,'&amp;')",
-    ".replace(/</g,'&lt;')",
-    ".replace(/>/g,'&gt;')",
-    ".replace(/\"/g,'&quot;')",
-
-    "}",
-
-    "</script>",
-
-    "</body>",
-    "</html>"
-  ].join("");
+function html() {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>X热点起飞雷达</title>
+
+<style>
+* {
+  box-sizing: border-box;
 }
 
+body {
+  margin: 0;
+  background: #050505;
+  color: white;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "PingFang SC",
+    "Helvetica Neue",
+    Arial,
+    sans-serif;
+}
 
-// ==========================
-// HTTP 服务
-// ==========================
+.page {
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 45px 22px 80px;
+}
 
-const server =
-  http.createServer(
-    async function(req,res){
+.title {
+  font-size: 42px;
+  font-weight: 800;
+  margin-bottom: 10px;
+}
 
-      if(req.url === "/"){
+.subtitle {
+  color: #777;
+  font-size: 24px;
+  margin-bottom: 42px;
+}
 
-        res.writeHead(
-          200,
-          {
-            "Content-Type":
-              "text/html; charset=utf-8"
-          }
-        );
+.scan {
+  width: 100%;
+  height: 105px;
+  border: 0;
+  border-radius: 25px;
+  background: #f1f1f1;
+  color: #1683f8;
+  font-size: 29px;
+  font-weight: 800;
+  cursor: pointer;
+}
 
-        res.end(
-          getHTML()
-        );
+.scan:active {
+  transform: scale(.98);
+}
 
-        return;
-      }
+.status {
+  color: #888;
+  font-size: 22px;
+  margin: 32px 0 20px;
+}
 
+.card {
+  background: #151515;
+  border: 1px solid #252525;
+  border-radius: 20px;
+  padding: 20px;
+  margin-bottom: 14px;
+}
 
-      if(req.url === "/api/scan"){
+.row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
 
-        try{
+.rank {
+  font-size: 22px;
+  color: #777;
+  width: 32px;
+}
 
-          const result =
-            await scan();
+.topic {
+  font-size: 22px;
+  font-weight: 700;
+  flex: 1;
+  word-break: break-all;
+}
 
-          res.writeHead(
-            200,
-            {
-              "Content-Type":
-                "application/json; charset=utf-8"
-            }
-          );
+.score {
+  font-size: 22px;
+  font-weight: 800;
+  color: #ff4d67;
+}
 
-          res.end(
-            JSON.stringify(result)
-          );
+.meta {
+  color: #777;
+  font-size: 15px;
+  margin-top: 10px;
+}
 
-        }catch(error){
+.error {
+  background: #241010;
+  border: 1px solid #632020;
+  color: #ff8d8d;
+  border-radius: 18px;
+  padding: 18px;
+  line-height: 1.6;
+  word-break: break-word;
+}
 
-          console.error(error);
+.empty {
+  color: #777;
+  padding: 20px 0;
+  font-size: 18px;
+}
+</style>
+</head>
 
-          res.writeHead(
-            500,
-            {
-              "Content-Type":
-                "application/json; charset=utf-8"
-            }
-          );
+<body>
 
-          res.end(
-            JSON.stringify({
-              success:false,
-              error:error.message
-            })
-          );
-        }
+<div class="page">
 
-        return;
-      }
+  <div class="title">🚀 X热点起飞雷达</div>
 
+  <div class="subtitle">
+    中文 X 热点实时聚合
+  </div>
 
-      res.writeHead(404);
+  <button class="scan" id="scanBtn">
+    🔥 立即扫描热点
+  </button>
 
-      res.end("Not Found");
+  <div class="status" id="status">
+    等待扫描
+  </div>
 
+  <div id="result"></div>
+
+</div>
+
+<script>
+const btn = document.getElementById("scanBtn");
+const status = document.getElementById("status");
+const result = document.getElementById("result");
+
+btn.addEventListener("click", async function () {
+
+  btn.disabled = true;
+  btn.style.opacity = "0.6";
+
+  status.innerText = "🔥 正在扫描 X 中文热点，请稍等……";
+  result.innerHTML = "";
+
+  try {
+
+    const response = await fetch("/api/scan", {
+      method: "GET",
+      cache: "no-store"
+    });
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || "扫描失败");
     }
+
+    status.innerText =
+      "扫描完成 · 获取 " +
+      data.scannedPosts +
+      " 条中文内容";
+
+    if (!data.topics || data.topics.length === 0) {
+      result.innerHTML =
+        '<div class="empty">暂时没有抓到足够的中文热点。再扫描一次试试。</div>';
+      return;
+    }
+
+    result.innerHTML = data.topics.map(function(item, index) {
+
+      return (
+        '<div class="card">' +
+          '<div class="row">' +
+            '<div class="rank">' +
+              (index + 1) +
+            '</div>' +
+
+            '<div class="topic">' +
+              escapeHtml(item.topic) +
+            '</div>' +
+
+            '<div class="score">' +
+              item.score +
+            '</div>' +
+          '</div>' +
+
+          '<div class="meta">' +
+            "内容 " + item.posts +
+            " · 作者 " + item.authors +
+            " · 热度 " + item.engagement +
+          '</div>' +
+        '</div>'
+      );
+
+    }).join("");
+
+  } catch (err) {
+
+    status.innerText = "❌ 扫描失败";
+
+    result.innerHTML =
+      '<div class="error">' +
+      escapeHtml(err.message || String(err)) +
+      '</div>';
+
+  } finally {
+
+    btn.disabled = false;
+    btn.style.opacity = "1";
+
+  }
+});
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+</script>
+
+</body>
+</html>`;
+}
+
+const server = http.createServer(async (req, res) => {
+
+  const url = new URL(
+    req.url,
+    "http://" + (req.headers.host || "localhost")
   );
 
+  console.log(new Date().toISOString(), req.method, url.pathname);
 
-server.listen(
-  PORT,
-  function(){
-    console.log(
-      "X热点起飞雷达启动成功，端口:",
-      PORT
-    );
+  if (url.pathname === "/") {
+    send(res, 200, html(), "text/html");
+    return;
   }
-);
+
+  if (url.pathname === "/health") {
+    send(res, 200, {
+      ok: true,
+      apifyToken: Boolean(APIFY_TOKEN),
+      actor: ACTOR_ID
+    });
+    return;
+  }
+
+  if (url.pathname === "/api/scan") {
+
+    try {
+      const data = await scanChina();
+
+      send(res, 200, data);
+    } catch (err) {
+
+      console.error("SCAN ERROR:", err);
+
+      send(res, 500, {
+        success: false,
+        error: err.message || "未知错误"
+      });
+    }
+
+    return;
+  }
+
+  send(res, 404, {
+    success: false,
+    error: "Not Found"
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log("X热点起飞雷达启动成功");
+  console.log("PORT:", PORT);
+  console.log("APIFY_TOKEN:", APIFY_TOKEN ? "已设置" : "未设置");
+  console.log("ACTOR:", ACTOR_ID);
+});
