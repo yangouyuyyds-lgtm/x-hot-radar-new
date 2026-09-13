@@ -5,15 +5,20 @@ const url = require("url");
 const PORT = process.env.PORT || 10000;
 const APIFY_TOKEN = process.env.APIFY_TOKEN;
 
-const ACTOR = "powerai~twitter-trends-scraper";
+const ACTOR = "simpleapi~twitter-trends-scraper";
+
 const APIFY_URL =
   "https://api.apify.com/v2/acts/" +
   ACTOR +
   "/run-sync-get-dataset-items";
 
 if (!APIFY_TOKEN) {
-  console.error("缺少 APIFY_TOKEN 环境变量");
+  console.error("❌ APIFY_TOKEN 未配置");
 }
+
+/* =========================
+   Apify 请求
+========================= */
 
 function callApify(input) {
   return new Promise((resolve, reject) => {
@@ -32,7 +37,7 @@ function callApify(input) {
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body)
         },
-        timeout: 120000
+        timeout: 180000
       },
       (res) => {
         let data = "";
@@ -42,30 +47,30 @@ function callApify(input) {
         });
 
         res.on("end", () => {
-          let parsed;
+          let result;
 
           try {
-            parsed = JSON.parse(data);
-          } catch (e) {
+            result = JSON.parse(data);
+          } catch (err) {
             return reject(
               new Error(
-                "Apify 返回了无法解析的数据：" +
+                "Apify 返回的数据无法解析：" +
                   data.slice(0, 500)
               )
             );
           }
 
-          if (res.statusCode < 200 || res.statusCode >= 300) {
+          if (
+            res.statusCode < 200 ||
+            res.statusCode >= 300
+          ) {
             const message =
-              parsed &&
-              parsed.error &&
-              parsed.error.message
-                ? parsed.error.message
-                : JSON.stringify(parsed);
+              result?.error?.message ||
+              JSON.stringify(result);
 
             return reject(
               new Error(
-                "Apify 返回错误 " +
+                "Apify HTTP " +
                   res.statusCode +
                   ": " +
                   message
@@ -73,14 +78,16 @@ function callApify(input) {
             );
           }
 
-          resolve(parsed);
+          resolve(result);
         });
       }
     );
 
     req.on("timeout", () => {
       req.destroy();
-      reject(new Error("Apify 请求超时，请稍后再试"));
+      reject(
+        new Error("Apify 请求超时")
+      );
     });
 
     req.on("error", (err) => {
@@ -92,13 +99,31 @@ function callApify(input) {
   });
 }
 
-function parseVolume(text) {
-  if (text === null || text === undefined) {
+/* =========================
+   工具
+========================= */
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function parseNumber(value) {
+  if (value === null || value === undefined) {
     return 0;
   }
 
-  const str = String(text).replace(/,/g, "");
-  const match = str.match(/([\d.]+)\s*([KMB])?/i);
+  const text = String(value)
+    .replace(/,/g, "")
+    .trim();
+
+  const match = text.match(
+    /([\d.]+)\s*([KMB])?/i
+  );
 
   if (!match) {
     return 0;
@@ -110,7 +135,8 @@ function parseVolume(text) {
     return 0;
   }
 
-  const unit = (match[2] || "").toUpperCase();
+  const unit =
+    (match[2] || "").toUpperCase();
 
   if (unit === "K") {
     number *= 1000;
@@ -127,25 +153,204 @@ function parseVolume(text) {
   return Math.round(number);
 }
 
-function isChinese(text) {
-  if (!text) {
-    return false;
+/* =========================
+   第一步：
+   找 X 真正支持的中国地点
+========================= */
+
+async function findChinaLocation() {
+  console.log(
+    "🇨🇳 正在查询 X 可用地区目录..."
+  );
+
+  const rows = await callApify({
+    listAvailableLocations: true,
+    catalogueTypeFilter: "country"
+  });
+
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      "地区目录返回格式异常"
+    );
   }
 
-  const str = String(text);
+  console.log(
+    "地区目录数量:",
+    rows.length
+  );
 
-  return /[\u4e00-\u9fff]/.test(str);
+  /*
+   * 只接受真正的中国国家级地点。
+   *
+   * 不接受：
+   * China, Hong Kong
+   * China, Taiwan
+   * Chinese-language trend
+   * 全球趋势
+   */
+
+  const china = rows.find((item) => {
+    const countryCode =
+      String(
+        item.countryCode || ""
+      ).toUpperCase();
+
+    const countryName =
+      String(
+        item.countryName || ""
+      ).toLowerCase();
+
+    const locationName =
+      String(
+        item.locationName || ""
+      ).toLowerCase();
+
+    const locationType =
+      String(
+        item.locationType || ""
+      ).toLowerCase();
+
+    return (
+      countryCode === "CN" &&
+      (
+        countryName === "china" ||
+        locationName === "china" ||
+        locationName === "中国"
+      ) &&
+      locationType === "country"
+    );
+  });
+
+  if (!china) {
+    console.log(
+      "❌ 地区目录中没有找到真正的 China country location"
+    );
+
+    return null;
+  }
+
+  console.log(
+    "✅ 找到中国地区:",
+    china
+  );
+
+  return china;
 }
 
-function categoryOf(name, context) {
-  const text = (
-    String(name || "") +
-    " " +
-    String(context || "")
-  ).toLowerCase();
+/* =========================
+   第二步：
+   用中国真实 WOEID 抓趋势
+========================= */
+
+async function getChinaTrends() {
+  const china =
+    await findChinaLocation();
+
+  if (!china) {
+    throw new Error(
+      "X 当前可验证的地区目录中没有找到中国全国级 Trends。为了保证数据真实，本次不会使用全球趋势冒充中国区。"
+    );
+  }
+
+  const woeid =
+    china.woeid;
+
+  if (!woeid) {
+    throw new Error(
+      "找到了中国地区，但没有返回 WOEID，无法安全抓取。"
+    );
+  }
+
+  console.log(
+    "🇨🇳 使用中国 WOEID:",
+    woeid
+  );
+
+  const rows = await callApify({
+    locations: [
+      String(woeid)
+    ],
+    maxTrendsPerLocation: 50
+  });
+
+  if (!Array.isArray(rows)) {
+    throw new Error(
+      "中国趋势返回格式异常"
+    );
+  }
+
+  /*
+   * 再做一次地区硬验证。
+   *
+   * 只有：
+   * countryCode === CN
+   * 并且 locationType === country
+   *
+   * 才允许进入中国区列表。
+   */
+
+  const verified =
+    rows.filter((item) => {
+
+      const countryCode =
+        String(
+          item.countryCode || ""
+        ).toUpperCase();
+
+      const locationType =
+        String(
+          item.locationType || ""
+        ).toLowerCase();
+
+      const itemWoeid =
+        String(
+          item.woeid || ""
+        );
+
+      return (
+        countryCode === "CN" &&
+        locationType === "country" &&
+        itemWoeid === String(woeid)
+      );
+    });
+
+  console.log(
+    "原始趋势:",
+    rows.length
+  );
+
+  console.log(
+    "通过中国地区验证:",
+    verified.length
+  );
+
+  /*
+   * 如果返回了全球 / 韩国 / 美国 / 日本等数据，
+   * 直接丢弃。
+   */
+
+  if (rows.length > 0 && verified.length === 0) {
+    throw new Error(
+      "抓取结果没有通过中国地区验证，已阻止错误数据进入中国区。"
+    );
+  }
+
+  return {
+    location: china,
+    items: verified
+  };
+}
+
+/* =========================
+   分类
+========================= */
+
+function detectCategory(name) {
+  const text =
+    String(name || "").toLowerCase();
 
   if (
-    /美女|美人|颜值|写真|小姐姐|女神|穿搭|时尚|裙子|衣服|模特|摄影|写真集|かわいい|cute|beauty|fashion|model/.test(
+    /美女|美人|女神|小姐姐|写真|穿搭|时尚|模特|裙子|颜值|摄影|beauty|fashion|model/.test(
       text
     )
   ) {
@@ -153,7 +358,7 @@ function categoryOf(name, context) {
   }
 
   if (
-    /娱乐|明星|演员|电影|电视剧|综艺|歌手|音乐|idol|movie|music|actor|entertainment/.test(
+    /娱乐|明星|演员|歌手|电影|电视剧|综艺|idol|movie|music/.test(
       text
     )
   ) {
@@ -161,15 +366,7 @@ function categoryOf(name, context) {
   }
 
   if (
-    /足球|篮球|nba|体育|比赛|球员|冠军|世界杯|sport|football|basketball/.test(
-      text
-    )
-  ) {
-    return "体育";
-  }
-
-  if (
-    /ai|人工智能|科技|互联网|iphone|apple|openai|chatgpt|technology|tech/.test(
+    /ai|人工智能|科技|互联网|chatgpt|openai|iphone|apple|tech/.test(
       text
     )
   ) {
@@ -177,7 +374,15 @@ function categoryOf(name, context) {
   }
 
   if (
-    /游戏|电竞|steam|lol|valorant|genshin|game|gaming/.test(
+    /足球|篮球|nba|体育|世界杯|球员|比赛|sport|football|basketball/.test(
+      text
+    )
+  ) {
+    return "体育";
+  }
+
+  if (
+    /游戏|电竞|steam|lol|valorant|genshin|gaming|game/.test(
       text
     )
   ) {
@@ -185,7 +390,7 @@ function categoryOf(name, context) {
   }
 
   if (
-    /新闻|政治|总统|政府|政策|战争|选举|politic|news|president/.test(
+    /政治|政府|总统|选举|战争|新闻|政策|politic|president|news/.test(
       text
     )
   ) {
@@ -195,136 +400,105 @@ function categoryOf(name, context) {
   return "综合";
 }
 
-function calcScore(item, index) {
-  const volume = parseVolume(item.description);
+/* =========================
+   趋势标准化
+========================= */
 
-  const rankScore = Math.max(0, 100 - index * 2);
-
-  let volumeScore = 0;
-
-  if (volume > 0) {
-    volumeScore = Math.min(
-      100,
-      Math.round(Math.log10(volume + 1) * 14)
-    );
-  }
-
-  return Math.min(
-    99,
-    Math.max(
-      1,
-      Math.round(rankScore * 0.7 + volumeScore * 0.3)
-    )
-  );
-}
-
-function normalizeItems(items) {
-  if (!Array.isArray(items)) {
-    return [];
-  }
-
-  return items
+function normalizeTrends(rows) {
+  return rows
     .map((item, index) => {
+
       const name =
-        item.name ||
-        item.trend_title ||
         item.trend ||
+        item.name ||
         item.title ||
+        item.trendName ||
         "";
 
-      const description =
-        item.description ||
-        item.tweets_volume ||
-        item.volume ||
+      const rank =
+        Number(item.rank) ||
+        index + 1;
+
+      const volume =
+        item.tweetVolume ??
+        item.volume ??
+        item.tweets ??
+        item.tweetCount ??
         "";
 
-      const context =
-        item.context ||
-        item.trend_category ||
-        item.category ||
-        "";
+      const locationName =
+        item.locationName || "";
+
+      const locationType =
+        item.locationType || "";
+
+      const countryCode =
+        item.countryCode || "";
+
+      const woeid =
+        item.woeid || "";
 
       return {
-        rank:
-          Number(item.rank) ||
-          index + 1,
-
+        rank,
         name: String(name),
+        volume: String(volume),
+        volumeNumber:
+          parseNumber(volume),
 
-        description: String(description),
+        category:
+          detectCategory(name),
 
-        volume: parseVolume(description),
+        locationName:
+          String(locationName),
 
-        context: String(context),
+        locationType:
+          String(locationType),
 
-        category: categoryOf(name, context),
+        countryCode:
+          String(countryCode),
 
-        score: calcScore(
-          {
-            description: description
-          },
-          index
-        ),
+        woeid:
+          String(woeid),
 
-        scrapedAt:
-          item.scrapedAt ||
-          new Date().toISOString()
+        score:
+          Math.max(
+            1,
+            Math.min(
+              99,
+              100 -
+                Math.min(
+                  90,
+                  (rank - 1) * 2
+                )
+            )
+          )
       };
     })
     .filter((item) => item.name);
 }
 
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
-
-async function getChinaTrends() {
-  if (!APIFY_TOKEN) {
-    throw new Error(
-      "服务器没有配置 APIFY_TOKEN"
-    );
-  }
-
-  const result = await callApify({
-    country: "China",
-    maxResults: 50
-  });
-
-  return normalizeItems(result);
-}
-
-async function getTrends(country) {
-  if (!APIFY_TOKEN) {
-    throw new Error(
-      "服务器没有配置 APIFY_TOKEN"
-    );
-  }
-
-  const input = {
-    country: country || "China",
-    maxResults: 50
-  };
-
-  const result = await callApify(input);
-
-  return normalizeItems(result);
-}
+/* =========================
+   HTML
+========================= */
 
 function pageHtml() {
   return `
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
+
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+
+<meta
+  name="viewport"
+  content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"
+/>
+
 <title>X热点起飞雷达</title>
 
 <style>
+
 * {
   box-sizing: border-box;
 }
@@ -333,12 +507,16 @@ body {
   margin: 0;
   background: #080b12;
   color: #f5f7fa;
-  font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",
-    "PingFang SC","Microsoft YaHei",sans-serif;
+  font-family:
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei",
+    sans-serif;
 }
 
 .container {
-  width: 100%;
   max-width: 760px;
   margin: 0 auto;
   padding: 18px 14px 50px;
@@ -351,7 +529,6 @@ body {
 .title {
   font-size: 25px;
   font-weight: 800;
-  letter-spacing: -0.5px;
 }
 
 .subtitle {
@@ -368,84 +545,74 @@ body {
 }
 
 .tab {
+  flex: 0 0 auto;
   border: 1px solid #252c39;
   background: #111621;
   color: #aeb7c5;
   border-radius: 999px;
-  padding: 9px 15px;
-  white-space: nowrap;
-  font-size: 13px;
+  padding: 10px 17px;
+  font-size: 14px;
 }
 
 .tab.active {
-  color: #fff;
-  background: #1d2635;
-  border-color: #46536a;
+  color: white;
+  border-color: #53627a;
+  background: #1a2333;
 }
 
 .scan {
   width: 100%;
   border: 0;
-  border-radius: 14px;
-  padding: 14px;
-  font-size: 16px;
-  font-weight: 700;
-  background: #fff;
+  border-radius: 16px;
+  padding: 17px;
+  font-size: 17px;
+  font-weight: 800;
+  background: white;
   color: #080b12;
   margin-bottom: 14px;
 }
 
-.scan:active {
-  transform: scale(.99);
-}
-
 .status {
   display: none;
-  padding: 13px 14px;
+  padding: 14px;
   background: #111621;
   border: 1px solid #252c39;
-  border-radius: 12px;
+  border-radius: 14px;
   color: #aeb7c5;
   font-size: 13px;
   margin-bottom: 14px;
+  line-height: 1.6;
 }
 
-.error {
-  color: #ff8f8f;
-}
-
-.empty {
-  text-align: center;
-  padding: 45px 20px;
-  color: #8791a1;
+.status.error {
+  color: #ff9999;
 }
 
 .card {
   background: #101520;
   border: 1px solid #202837;
-  border-radius: 16px;
-  padding: 15px;
-  margin-bottom: 10px;
+  border-radius: 18px;
+  padding: 16px;
+  margin-bottom: 11px;
 }
 
 .cardTop {
   display: flex;
-  align-items: flex-start;
   gap: 12px;
+  align-items: flex-start;
 }
 
 .rank {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: #1a2130;
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: #192132;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #aeb7c5;
-  font-size: 13px;
-  font-weight: 800;
   flex: 0 0 auto;
+  font-weight: 800;
+  color: #b7c0cf;
 }
 
 .content {
@@ -455,8 +622,8 @@ body {
 
 .name {
   font-size: 17px;
-  font-weight: 750;
-  line-height: 1.35;
+  font-weight: 800;
+  line-height: 1.4;
   word-break: break-word;
 }
 
@@ -464,50 +631,57 @@ body {
   margin-top: 7px;
   color: #7f8999;
   font-size: 12px;
-  line-height: 1.5;
 }
 
 .tags {
   display: flex;
-  gap: 6px;
+  gap: 7px;
   flex-wrap: wrap;
   margin-top: 10px;
 }
 
 .tag {
-  font-size: 11px;
-  color: #aeb7c5;
   border: 1px solid #293243;
   background: #151b27;
   border-radius: 999px;
-  padding: 4px 8px;
+  padding: 5px 9px;
+  color: #aeb7c5;
+  font-size: 11px;
 }
 
 .score {
-  flex: 0 0 auto;
-  text-align: center;
   min-width: 58px;
+  text-align: center;
 }
 
 .scoreNum {
-  font-size: 22px;
-  font-weight: 850;
+  font-size: 23px;
+  font-weight: 900;
 }
 
 .scoreLabel {
-  color: #6f7989;
+  margin-top: 3px;
+  color: #707b8d;
   font-size: 10px;
-  margin-top: 2px;
+}
+
+.empty {
+  padding: 55px 20px;
+  text-align: center;
+  color: #7f8999;
+  line-height: 1.7;
 }
 
 .footer {
-  margin-top: 20px;
   text-align: center;
-  color: #596273;
+  margin-top: 22px;
+  color: #566071;
   font-size: 11px;
-  line-height: 1.6;
+  line-height: 1.7;
 }
+
 </style>
+
 </head>
 
 <body>
@@ -515,45 +689,75 @@ body {
 <div class="container">
 
   <div class="header">
-    <div class="title">🚀 X热点起飞雷达</div>
-    <div class="subtitle">
-      实时发现正在升温的 X 热点
+
+    <div class="title">
+      🚀 X热点起飞雷达
     </div>
+
+    <div class="subtitle">
+      只展示通过真实地区验证的 X 趋势
+    </div>
+
   </div>
 
   <div class="tabs">
-    <button class="tab active" onclick="selectCountry('China', this)">
+
+    <button
+      class="tab active"
+      onclick="selectCountry('China',this)"
+    >
       🇨🇳 中国区
     </button>
 
-    <button class="tab" onclick="selectCountry('UnitedStates', this)">
+    <button
+      class="tab"
+      onclick="selectCountry('UnitedStates',this)"
+    >
       🇺🇸 美国区
     </button>
 
-    <button class="tab" onclick="selectCountry('Japan', this)">
+    <button
+      class="tab"
+      onclick="selectCountry('Japan',this)"
+    >
       🇯🇵 日本区
     </button>
 
-    <button class="tab" onclick="selectCountry('UnitedKingdom', this)">
+    <button
+      class="tab"
+      onclick="selectCountry('UnitedKingdom',this)"
+    >
       🇬🇧 英国区
     </button>
+
   </div>
 
-  <button class="scan" onclick="scan()">
+  <button
+    class="scan"
+    onclick="scan()"
+  >
     🔥 立即扫描热点
   </button>
 
-  <div id="status" class="status"></div>
+  <div
+    id="status"
+    class="status"
+  ></div>
 
   <div id="list">
+
     <div class="empty">
-      点击「立即扫描热点」获取最新趋势
+      点击「立即扫描热点」开始
     </div>
+
   </div>
 
   <div class="footer">
-    数据来自 X 趋势抓取服务<br>
-    「起飞指数」为趋势排序与讨论量综合计算值
+
+    数据源：X 地区趋势抓取<br>
+
+    中国区必须通过 CN + country + WOEID 三重验证
+
   </div>
 
 </div>
@@ -563,6 +767,7 @@ body {
 let currentCountry = "China";
 
 function selectCountry(country, button) {
+
   currentCountry = country;
 
   document
@@ -576,50 +781,51 @@ function selectCountry(country, button) {
   scan();
 }
 
-function setStatus(text, isError) {
-  const el = document.getElementById("status");
+function setStatus(text, error) {
+
+  const el =
+    document.getElementById("status");
 
   el.style.display = "block";
 
-  el.className = isError
-    ? "status error"
-    : "status";
+  el.className =
+    error
+      ? "status error"
+      : "status";
 
   el.innerText = text;
 }
 
 function escapeHtml(text) {
+
   return String(text || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;")
+    .replace(/'/g,"&#039;");
 }
 
 function render(items) {
-  const list = document.getElementById("list");
 
-  if (!items || !items.length) {
+  const list =
+    document.getElementById("list");
+
+  if (!items.length) {
+
     list.innerHTML =
-      '<div class="empty">当前地区暂时没有返回趋势数据</div>';
+      '<div class="empty">' +
+      '当前没有通过地区验证的趋势数据' +
+      '</div>';
 
     return;
   }
 
-  list.innerHTML = items
-    .map(function(item) {
-
-      const context =
-        item.context || "Trending";
-
-      const category =
-        item.category || "综合";
-
-      const description =
-        item.description || "";
+  list.innerHTML =
+    items.map(function(item) {
 
       return (
+
         '<div class="card">' +
 
           '<div class="cardTop">' +
@@ -635,18 +841,23 @@ function render(items) {
               '</div>' +
 
               '<div class="meta">' +
-                escapeHtml(description) +
-                " · " +
-                escapeHtml(context) +
+
+                (item.volume
+                  ? '讨论量 · ' +
+                    escapeHtml(item.volume)
+                  : 'X Trending') +
+
               '</div>' +
 
               '<div class="tags">' +
 
                 '<span class="tag">' +
-                  escapeHtml(category) +
+                  escapeHtml(item.category) +
                 '</span>' +
 
-                '<span class="tag">🇨🇳 中国区</span>' +
+                '<span class="tag">' +
+                  '🇨🇳 中国区' +
+                '</span>' +
 
               '</div>' +
 
@@ -658,17 +869,19 @@ function render(items) {
                 escapeHtml(item.score) +
               '</div>' +
 
-              '<div class="scoreLabel">起飞指数</div>' +
+              '<div class="scoreLabel">' +
+                '起飞指数' +
+              '</div>' +
 
             '</div>' +
 
           '</div>' +
 
         '</div>'
+
       );
 
-    })
-    .join("");
+    }).join("");
 }
 
 async function scan() {
@@ -677,12 +890,19 @@ async function scan() {
     document.querySelector(".scan");
 
   button.disabled = true;
-  button.innerText = "⏳ 正在扫描...";
+
+  button.innerText =
+    "⏳ 正在验证中国地区...";
+
+  document.getElementById("list")
+    .innerHTML =
+    '<div class="empty">' +
+    '正在查询 X 地区目录...<br>' +
+    '然后验证中国 WOEID...' +
+    '</div>';
 
   setStatus(
-    "正在抓取 " +
-    countryName(currentCountry) +
-    " 最新趋势，请稍候...",
+    "正在获取真实地区数据，请稍候...",
     false
   );
 
@@ -691,26 +911,32 @@ async function scan() {
     const response =
       await fetch(
         "/api/trends?country=" +
-        encodeURIComponent(currentCountry)
+        encodeURIComponent(
+          currentCountry
+        )
       );
 
     const data =
       await response.json();
 
     if (!response.ok) {
+
       throw new Error(
-        data.error || "扫描失败"
+        data.error ||
+        "扫描失败"
       );
     }
 
-    render(data.items || []);
+    render(
+      data.items || []
+    );
 
     setStatus(
-      "✅ 已获取 " +
-      (data.items || []).length +
-      " 条 " +
-      countryName(currentCountry) +
-      " 趋势",
+      "✅ " +
+      data.locationName +
+      " · 已通过地区验证 · " +
+      data.items.length +
+      " 条趋势",
       false
     );
 
@@ -718,13 +944,14 @@ async function scan() {
 
     console.error(error);
 
-    document.getElementById("list").innerHTML =
+    document.getElementById("list")
+      .innerHTML =
       '<div class="empty">' +
+      '⚠️ ' +
       escapeHtml(error.message) +
-      "</div>";
+      '</div>';
 
     setStatus(
-      "扫描失败：" +
       error.message,
       true
     );
@@ -732,167 +959,212 @@ async function scan() {
   } finally {
 
     button.disabled = false;
-    button.innerText = "🔥 立即扫描热点";
 
+    button.innerText =
+      "🔥 立即扫描热点";
   }
-}
-
-function countryName(country) {
-
-  const map = {
-    China: "🇨🇳 中国区",
-    UnitedStates: "🇺🇸 美国区",
-    Japan: "🇯🇵 日本区",
-    UnitedKingdom: "🇬🇧 英国区"
-  };
-
-  return map[country] || country;
 }
 
 </script>
 
 </body>
+
 </html>
 `;
 }
 
-const server = http.createServer(async (req, res) => {
+/* =========================
+   HTTP Server
+========================= */
 
-  const parsedUrl = url.parse(
-    req.url,
-    true
-  );
+const server =
+  http.createServer(
+    async (req, res) => {
 
-  if (parsedUrl.pathname === "/") {
+      const parsed =
+        url.parse(
+          req.url,
+          true
+        );
 
-    res.writeHead(200, {
-      "Content-Type":
-        "text/html; charset=utf-8"
-    });
+      /* 首页 */
 
-    res.end(pageHtml());
+      if (parsed.pathname === "/") {
 
-    return;
-  }
+        res.writeHead(200, {
+          "Content-Type":
+            "text/html; charset=utf-8"
+        });
 
-  if (parsedUrl.pathname === "/api/health") {
+        res.end(
+          pageHtml()
+        );
 
-    res.writeHead(200, {
-      "Content-Type":
-        "application/json; charset=utf-8"
-    });
+        return;
+      }
 
-    res.end(
-      JSON.stringify({
-        ok: true,
-        actor: ACTOR,
-        hasToken: !!APIFY_TOKEN
-      })
-    );
+      /* 健康检查 */
 
-    return;
-  }
+      if (
+        parsed.pathname ===
+        "/api/health"
+      ) {
 
-  if (parsedUrl.pathname === "/api/trends") {
+        res.writeHead(200, {
+          "Content-Type":
+            "application/json; charset=utf-8"
+        });
 
-    const country =
-      parsedUrl.query.country || "China";
+        res.end(
+          JSON.stringify({
+            ok: true,
+            actor: ACTOR,
+            hasToken:
+              !!APIFY_TOKEN
+          })
+        );
 
-    const allowed = [
-      "China",
-      "UnitedStates",
-      "Japan",
-      "UnitedKingdom"
-    ];
+        return;
+      }
 
-    if (!allowed.includes(country)) {
+      /* 趋势 */
 
-      res.writeHead(400, {
+      if (
+        parsed.pathname ===
+        "/api/trends"
+      ) {
+
+        const country =
+          parsed.query.country ||
+          "China";
+
+        /*
+         * 目前这一版先把中国区
+         * 做成真正的 WOEID 验证。
+         *
+         * 其他地区暂时不允许走旧逻辑，
+         * 防止再次出现“全球数据冒充地区”。
+         */
+
+        if (country !== "China") {
+
+          res.writeHead(400, {
+            "Content-Type":
+              "application/json; charset=utf-8"
+          });
+
+          res.end(
+            JSON.stringify({
+              error:
+                "这一版正在先验证中国区真实地区源。美国、日本、英国暂不启用旧数据源。"
+            })
+          );
+
+          return;
+        }
+
+        try {
+
+          console.log(
+            "=========================="
+          );
+
+          console.log(
+            "🇨🇳 开始中国区真实地区扫描"
+          );
+
+          const result =
+            await getChinaTrends();
+
+          const items =
+            normalizeTrends(
+              result.items
+            );
+
+          res.writeHead(200, {
+            "Content-Type":
+              "application/json; charset=utf-8",
+
+            "Cache-Control":
+              "no-store"
+          });
+
+          res.end(
+            JSON.stringify({
+              success: true,
+
+              country: "China",
+
+              locationName:
+                result.location.locationName,
+
+              countryCode:
+                result.location.countryCode,
+
+              locationType:
+                result.location.locationType,
+
+              woeid:
+                result.location.woeid,
+
+              items,
+
+              count:
+                items.length,
+
+              fetchedAt:
+                new Date().toISOString()
+            })
+          );
+
+          console.log(
+            "🇨🇳 中国区扫描完成:",
+            items.length
+          );
+
+        } catch (error) {
+
+          console.error(
+            "❌ 中国区扫描失败:",
+            error
+          );
+
+          res.writeHead(500, {
+            "Content-Type":
+              "application/json; charset=utf-8"
+          });
+
+          res.end(
+            JSON.stringify({
+              success: false,
+              error:
+                error.message
+            })
+          );
+        }
+
+        return;
+      }
+
+      res.writeHead(404, {
         "Content-Type":
           "application/json; charset=utf-8"
       });
 
       res.end(
         JSON.stringify({
-          error: "不支持的地区"
-        })
-      );
-
-      return;
-    }
-
-    try {
-
-      console.log(
-        "开始抓取地区:",
-        country
-      );
-
-      const items =
-        await getTrends(country);
-
-      console.log(
-        "抓取完成:",
-        country,
-        items.length
-      );
-
-      res.writeHead(200, {
-        "Content-Type":
-          "application/json; charset=utf-8",
-        "Cache-Control":
-          "no-store"
-      });
-
-      res.end(
-        JSON.stringify({
-          success: true,
-          country: country,
-          items: items,
-          count: items.length,
-          fetchedAt:
-            new Date().toISOString()
-        })
-      );
-
-    } catch (error) {
-
-      console.error(
-        "抓取失败:",
-        error
-      );
-
-      res.writeHead(500, {
-        "Content-Type":
-          "application/json; charset=utf-8"
-      });
-
-      res.end(
-        JSON.stringify({
-          success: false,
-          error: error.message
+          error: "Not Found"
         })
       );
     }
-
-    return;
-  }
-
-  res.writeHead(404, {
-    "Content-Type":
-      "application/json; charset=utf-8"
-  });
-
-  res.end(
-    JSON.stringify({
-      error: "Not Found"
-    })
   );
-});
 
-server.listen(PORT, () => {
-  console.log(
-    "X热点起飞雷达 running on port " +
+server.listen(
+  PORT,
+  () => {
+    console.log(
+      "🚀 X热点起飞雷达运行中，端口:",
       PORT
-  );
-});
+    );
+  }
+);
