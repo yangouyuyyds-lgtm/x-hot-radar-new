@@ -1,190 +1,614 @@
-const http=require("http");
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+const APIFY_TOKEN = process.env.APIFY_TOKEN || "";
 
-const PORT=process.env.PORT||3000;
-const TOKEN=process.env.APIFY_TOKEN||"";
-
-const html=`<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8">
+const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>X热点起飞雷达</title>
+
 <style>
 *{box-sizing:border-box}
-body{margin:0;background:#f4f6fa;color:#111;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+body{
+ margin:0;
+ background:#f5f7fb;
+ color:#111;
+ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
+}
 .wrap{max-width:760px;margin:auto;padding:18px 14px 40px}
-h1{font-size:30px;margin:8px 0 4px}.sub{color:#777;font-size:16px;margin-bottom:18px}
-.card{background:#fff;border-radius:22px;padding:16px;margin-bottom:14px;box-shadow:0 4px 18px #0000000b}
+h1{font-size:29px;margin:8px 0}
+.sub{color:#777;font-size:16px;margin-bottom:18px}
+
+.panel{
+ background:#fff;
+ border-radius:22px;
+ padding:16px;
+ margin-bottom:14px;
+ box-shadow:0 3px 18px #00000008
+}
+
 .row{display:flex;gap:10px}
-select,button{height:48px;border-radius:14px;font-size:16px}
-select{flex:1;border:1px solid #ddd;padding:0 12px;background:#fff}
-button{border:0;padding:0 18px;background:#111;color:#fff;font-weight:700}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-.stat{background:#fff;border-radius:18px;padding:15px 8px;text-align:center}
-.num{font-size:25px;font-weight:800}.label{font-size:12px;color:#888;margin-top:4px}
-.tabs{display:flex;gap:8px;overflow:auto}
-.tab{white-space:nowrap;border:0;background:#f0f1f4;color:#555;padding:11px 15px;border-radius:20px;font-weight:700}
-.tab.on{background:#111;color:#fff}
-.item{padding:17px 0;border-bottom:1px solid #eee}.item:last-child{border-bottom:0}
-.top{display:flex;justify-content:space-between;gap:10px}
-.rank{color:#999;font-size:13px}.score{color:#e85d21;font-weight:800}
-.name{font-size:19px;font-weight:750;margin:7px 0}
-.badge{display:inline-block;font-size:12px;padding:4px 9px;border-radius:12px;background:#fff0e9;color:#d85a21;margin-left:6px}
-.meta{color:#888;font-size:13px;line-height:1.7}
-.actions{margin-top:9px;display:flex;gap:8px;align-items:center}
-a{color:#2467d8;text-decoration:none;font-weight:700}
-.fav{border:0;background:#f0f1f4;color:#333;height:38px;padding:0 13px;border-radius:18px;font-weight:700}
-.loading{text-align:center;padding:38px 10px;color:#888}
-.error{color:#c62828;line-height:1.7}.small{font-size:12px;color:#999;margin-top:8px}
-</style></head><body>
+select,button{
+ height:48px;
+ border-radius:14px;
+ border:1px solid #ddd;
+ font-size:16px
+}
+select{
+ flex:1;
+ padding:0 12px;
+ background:#fff
+}
+button{
+ padding:0 18px;
+ background:#111;
+ color:#fff;
+ border:0;
+ font-weight:700
+}
+
+.filters{
+ display:flex;
+ gap:8px;
+ overflow-x:auto;
+ padding-bottom:2px
+}
+.filter{
+ white-space:nowrap;
+ background:#f0f1f4;
+ color:#555;
+ border-radius:18px;
+ padding:10px 15px;
+ font-size:15px;
+ font-weight:600
+}
+.filter.active{
+ background:#111;
+ color:#fff
+}
+
+.stats{
+ display:grid;
+ grid-template-columns:repeat(3,1fr);
+ gap:8px;
+ margin-bottom:14px
+}
+.stat{
+ background:#fff;
+ border-radius:18px;
+ padding:13px 5px;
+ text-align:center
+}
+.num{font-size:24px;font-weight:800}
+.label{font-size:12px;color:#888;margin-top:3px}
+
+.item{
+ padding:17px 0;
+ border-bottom:1px solid #eee
+}
+.item:last-child{border-bottom:0}
+
+.topline{
+ display:flex;
+ justify-content:space-between;
+ align-items:center
+}
+.rank{color:#999;font-size:14px}
+.score{
+ color:#e65100;
+ font-size:17px;
+ font-weight:800
+}
+.name{
+ font-size:19px;
+ font-weight:750;
+ margin:8px 0
+}
+.badge{
+ display:inline-block;
+ padding:4px 9px;
+ border-radius:10px;
+ background:#fff0e8;
+ color:#e45b20;
+ font-size:12px;
+ margin-left:5px
+}
+.meta{
+ color:#888;
+ font-size:13px;
+ line-height:1.7
+}
+.advice{
+ margin-top:9px;
+ background:#f7f8fa;
+ border-radius:12px;
+ padding:10px 12px;
+ font-size:14px;
+ line-height:1.6
+}
+.good{color:#e65100;font-weight:800}
+.mid{color:#d28a00;font-weight:800}
+.bad{color:#888;font-weight:700}
+
+.actions{
+ display:flex;
+ gap:8px;
+ margin-top:10px
+}
+.actions a,.fav{
+ flex:1;
+ text-align:center;
+ padding:10px;
+ border-radius:12px;
+ text-decoration:none;
+ font-size:14px;
+ font-weight:650
+}
+.actions a{
+ background:#eef3ff;
+ color:#1769e0
+}
+.fav{
+ background:#f0f1f4;
+ color:#333;
+ border:0;
+ height:auto
+}
+.fav.on{
+ background:#111;
+ color:#fff
+}
+
+.loading{
+ text-align:center;
+ padding:35px 10px;
+ color:#888
+}
+.error{
+ color:#d33;
+ line-height:1.7;
+ padding:15px 0
+}
+
+.empty{
+ text-align:center;
+ padding:35px 10px;
+ color:#888
+}
+
+@media(max-width:500px){
+ .wrap{padding:14px 12px 30px}
+ h1{font-size:27px}
+ .name{font-size:18px}
+}
+</style>
+</head>
+
+<body>
+
 <div class="wrap">
+
 <h1>🔥 X 热点起飞雷达</h1>
-<div class="sub">实时扫描 X 热门趋势，快速找值得跟的热点</div>
+<div class="sub">实时发现正在升温、值得蹭的 X 热点</div>
 
-<div class="card"><div class="row">
-<select id="location">
-<option value="1">🌎 全球</option>
-<option value="23424977">🇺🇸 美国</option>
-<option value="23424975">🇬🇧 英国</option>
-<option value="23424856">🇯🇵 日本</option>
-<option value="23424775">🇨🇦 加拿大</option>
-<option value="23424748">🇦🇺 澳大利亚</option>
-</select>
-<button onclick="scan()">立即扫描</button>
-</div></div>
-
-<div class="stats">
-<div class="stat"><div class="num" id="count">-</div><div class="label">热点数量</div></div>
-<div class="stat"><div class="num" id="hot">-</div><div class="label">高热热点</div></div>
-<div class="stat"><div class="num" id="time">-</div><div class="label">更新时间</div></div>
+<div class="panel">
+ <div class="row">
+  <select id="location">
+   <option value="1">🌎 全球</option>
+   <option value="23424977">🇺🇸 美国</option>
+   <option value="23424975">🇬🇧 英国</option>
+   <option value="23424856">🇯🇵 日本</option>
+   <option value="23424775">🇨🇦 加拿大</option>
+   <option value="23424748">🇦🇺 澳大利亚</option>
+  </select>
+  <button onclick="scan()">立即扫描</button>
+ </div>
 </div>
 
-<div class="card" style="margin-top:14px"><div class="tabs">
-<button class="tab on" data-cat="all" onclick="setCat(this)">🔥 全部</button>
-<button class="tab" data-cat="cn" onclick="setCat(this)">🇨🇳 中文</button>
-<button class="tab" data-cat="beauty" onclick="setCat(this)">💃 美女时尚</button>
-<button class="tab" data-cat="ent" onclick="setCat(this)">🎬 娱乐</button>
-<button class="tab" data-cat="sport" onclick="setCat(this)">⚽ 体育</button>
-</div></div>
+<div class="panel">
+ <div class="filters">
+  <div class="filter active" onclick="setFilter('all',this)">🔥 全部</div>
+  <div class="filter" onclick="setFilter('cn',this)">🇨🇳 中文</div>
+  <div class="filter" onclick="setFilter('beauty',this)">👙 美女时尚</div>
+  <div class="filter" onclick="setFilter('ent',this)">🎬 娱乐明星</div>
+  <div class="filter" onclick="setFilter('photo',this)">📸 摄影穿搭</div>
+ </div>
+</div>
 
-<div class="card">
-<div id="status" class="loading">点击「立即扫描」获取实时热点</div>
-<div id="list"></div>
-</div></div>
+<div class="stats">
+ <div class="stat">
+  <div class="num" id="count">-</div>
+  <div class="label">热点数量</div>
+ </div>
+ <div class="stat">
+  <div class="num" id="hot">-</div>
+  <div class="label">值得关注</div>
+ </div>
+ <div class="stat">
+  <div class="num" id="time">-</div>
+  <div class="label">更新时间</div>
+ </div>
+</div>
+
+<div class="panel">
+ <div id="status" class="loading">
+  点击「立即扫描」获取实时热点
+ </div>
+ <div id="list"></div>
+</div>
+
+</div>
 
 <script>
-let allItems=[],category="all";
 
-function esc(s){
-return String(s||"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
+let allItems=[];
+let currentFilter="all";
+
+const beautyWords=[
+ "美女","美人","女生","女孩","小姐姐","模特","model",
+ "fashion","beauty","outfit","dress","穿搭","时尚","美妆",
+ "写真","摄影","photo","photography","cosplay","cos",
+ "idol","偶像","女神","网红","明星","艺人"
+];
+
+const entertainmentWords=[
+ "明星","演员","歌手","艺人","电影","电视剧","综艺",
+ "music","movie","actor","actress","singer","concert",
+ "celebrity","idol","anime","manga"
+];
+
+const photoWords=[
+ "photo","photography","camera","写真","摄影","穿搭",
+ "outfit","fashion","model","模特","街拍","旅行"
+];
+
+const chineseRegex=/[\\u3400-\\u9fff]/;
+
+function hasWord(name,words){
+ const s=String(name||"").toLowerCase();
+ return words.some(w=>s.includes(w.toLowerCase()));
 }
 
-function classify(n){
-let s=String(n||"");
-if(/[\\u4e00-\\u9fff]/.test(s))return"cn";
-if(/beauty|fashion|model|girl|women|woman|makeup|dress|outfit|style|bikini|swimwear|celebrity/i.test(s))return"beauty";
-if(/movie|film|music|singer|actor|actress|tv|show|netflix|grammy|oscar/i.test(s))return"ent";
-if(/nba|nfl|mlb|nhl|football|soccer|tennis|f1|formula|olympics|ufc|boxing/i.test(s))return"sport";
-return"other";
+function isChinese(name){
+ return chineseRegex.test(String(name||""));
 }
 
-function setCat(b){
-document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
-b.classList.add("on");category=b.dataset.cat;render();
+function getCategory(name){
+ if(hasWord(name,beautyWords)) return "美女时尚";
+ if(hasWord(name,entertainmentWords)) return "娱乐";
+ if(hasWord(name,photoWords)) return "摄影穿搭";
+ if(isChinese(name)) return "中文";
+ return "";
 }
 
-function score(x){
-let r=Number(x.rank)||50,v=Number(x.tweetVolume)||0;
-let s=100-Math.min(Math.max(r-1,0)*1.5,60);
-if(v>=100000)s+=10;else if(v>=50000)s+=7;else if(v>=10000)s+=4;
-return Math.min(99,Math.max(50,Math.round(s)));
+function scoreItem(x){
+
+ let rank=Number(x.rank)||50;
+ let score=100-Math.min(rank*1.5,55);
+
+ const name=String(x.name||"");
+
+ if(isChinese(name)) score+=12;
+ if(hasWord(name,beautyWords)) score+=18;
+ if(hasWord(name,entertainmentWords)) score+=8;
+ if(hasWord(name,photoWords)) score+=10;
+
+ const volume=Number(x.tweetVolume)||0;
+
+ if(volume>=100000) score+=15;
+ else if(volume>=50000) score+=12;
+ else if(volume>=10000) score+=8;
+ else if(volume>=1000) score+=4;
+
+ return Math.max(1,Math.min(100,Math.round(score)));
+}
+
+function advice(score,category){
+
+ if(score>=85){
+  return {
+   text:"🚀 强烈建议蹭",
+   cls:"good",
+   idea:category==="美女时尚"
+    ?"💡 推荐：美女图片 + 热点关键词 + 一个简单问题，引导评论。"
+    :"💡 推荐：围绕热点快速发布相关内容，并在评论区参与讨论。"
+  };
+ }
+
+ if(score>=65){
+  return {
+   text:"🟠 可以蹭",
+   cls:"mid",
+   idea:"💡 推荐：先观察热度，再决定是否发帖，不要硬蹭。"
+  };
+ }
+
+ return {
+  text:"⚪ 不建议蹭",
+  cls:"bad",
+  idea:"💡 推荐：暂时观察，等待热点进一步升温。"
+ };
+}
+
+function setFilter(type,el){
+
+ currentFilter=type;
+
+ document.querySelectorAll(".filter")
+ .forEach(x=>x.classList.remove("active"));
+
+ el.classList.add("active");
+
+ render();
 }
 
 function render(){
-let list=document.getElementById("list");
-let items=allItems.slice();
-if(category!="all")items=items.filter(x=>classify(x.name)==category);
-if(!items.length){list.innerHTML='<div class="loading">这个分类暂时没有匹配热点</div>';return}
-list.innerHTML=items.map(x=>{
-let sc=score(x),v=x.tweetVolume?Number(x.tweetVolume).toLocaleString():"暂无";
-let c=classify(x.name);
-let label={cn:"中文",beauty:"美女时尚",ent:"娱乐",sport:"体育",other:""}[c];
-return '<div class="item">'+
-'<div class="top"><div class="rank">#'+(x.rank||"-")+'</div><div class="score">🔥 起飞指数 '+sc+'</div></div>'+
-'<div class="name">'+esc(x.name)+(label?'<span class="badge">'+label+'</span>':"")+'</div>'+
-'<div class="meta">讨论量：'+v+'<br>趋势排名：第 '+(x.rank||"-")+' 位</div>'+
-'<div class="actions"><a href="'+esc(x.url||"#")+'" target="_blank">在 X 查看 →</a>'+
-'<button class="fav" onclick="saveHot('+JSON.stringify(String(x.name||""))+')">☆ 收藏</button></div></div>';
-}).join("");
+
+ let items=allItems.slice();
+
+ if(currentFilter==="cn"){
+  items=items.filter(x=>isChinese(x.name));
+ }
+
+ if(currentFilter==="beauty"){
+  items=items.filter(x=>hasWord(x.name,beautyWords));
+ }
+
+ if(currentFilter==="ent"){
+  items=items.filter(x=>hasWord(x.name,entertainmentWords));
+ }
+
+ if(currentFilter==="photo"){
+  items=items.filter(x=>hasWord(x.name,photoWords));
+ }
+
+ document.getElementById("count").textContent=items.length;
+
+ document.getElementById("hot").textContent=
+ items.filter(x=>x.score>=65).length;
+
+ if(!items.length){
+  document.getElementById("list").innerHTML=
+   '<div class="empty">这个分类暂时没有匹配热点<br>换一个分类试试</div>';
+  return;
+ }
+
+ document.getElementById("list").innerHTML=
+ items.map((x,i)=>{
+
+  const a=advice(x.score,x.category);
+
+  const volume=x.tweetVolume
+   ?Number(x.tweetVolume).toLocaleString()
+   :"暂无";
+
+  const cat=x.category
+   ?'<span class="badge">'+escapeHtml(x.category)+'</span>'
+   :"";
+
+  return '<div class="item">'+
+
+   '<div class="topline">'+
+    '<div class="rank">#'+(i+1)+' · 原始排名 '+x.rank+'</div>'+
+    '<div class="score">🔥 '+x.score+'</div>'+
+   '</div>'+
+
+   '<div class="name">'+
+    escapeHtml(x.name)+cat+
+   '</div>'+
+
+   '<div class="meta">'+
+    '讨论量：'+volume+
+   '</div>'+
+
+   '<div class="advice">'+
+    '<span class="'+a.cls+'">'+a.text+'</span>'+
+    '<br>'+a.idea+
+   '</div>'+
+
+   '<div class="actions">'+
+    '<a href="'+escapeAttr(x.url)+'" target="_blank">在 X 查看 →</a>'+
+    '<button class="fav '+(isFav(x.name)?"on":"")+
+    '" onclick="favorite(\\''+escapeJs(x.name)+'\\')">'+
+    (isFav(x.name)?"★ 已收藏":"☆ 收藏")+
+    '</button>'+
+   '</div>'+
+
+  '</div>';
+
+ }).join("");
 }
 
-function saveHot(n){
-try{
-let a=JSON.parse(localStorage.getItem("x_hot_fav")||"[]");
-if(!a.includes(n))a.unshift(n);
-localStorage.setItem("x_hot_fav",JSON.stringify(a.slice(0,100)));
-alert("已收藏："+n);
-}catch(e){}
+function favorite(name){
+
+ let favs=JSON.parse(localStorage.getItem("x_favs")||"[]");
+
+ if(favs.includes(name)){
+  favs=favs.filter(x=>x!==name);
+ }else{
+  favs.push(name);
+ }
+
+ localStorage.setItem("x_favs",JSON.stringify(favs));
+ render();
+}
+
+function isFav(name){
+ const favs=JSON.parse(localStorage.getItem("x_favs")||"[]");
+ return favs.includes(name);
 }
 
 async function scan(){
-let status=document.getElementById("status"),list=document.getElementById("list");
-status.innerHTML="⏳ 正在扫描 X 热点，请稍等……";list.innerHTML="";
-try{
-let w=document.getElementById("location").value;
-let r=await fetch("/api/trends?woeid="+encodeURIComponent(w));
-let d=await r.json();
-if(!r.ok)throw new Error(d.error||"扫描失败");
-allItems=Array.isArray(d.items)?d.items:[];
-document.getElementById("count").textContent=allItems.length;
-document.getElementById("hot").textContent=allItems.filter(x=>Number(x.rank)<=10).length;
-document.getElementById("time").textContent=new Date().toLocaleTimeString("zh-CN",{hour:"2-digit",minute:"2-digit"});
-status.innerHTML="";render();
-}catch(e){
-status.innerHTML='<div class="error">❌ '+esc(e.message)+'</div><div class="small">如果提示 APIFY_TOKEN 未配置，请去 Render → Environment 设置。</div>';
+
+ const status=document.getElementById("status");
+
+ status.innerHTML="⏳ 正在扫描 X 实时热点……";
+ document.getElementById("list").innerHTML="";
+
+ try{
+
+  const woeid=document.getElementById("location").value;
+
+  const response=
+   await fetch("/api/trends?woeid="+encodeURIComponent(woeid));
+
+  const data=await response.json();
+
+  if(!response.ok){
+   throw new Error(data.error||"扫描失败");
+  }
+
+  allItems=(data.items||[]).map(x=>({
+   ...x,
+   score:scoreItem(x),
+   category:getCategory(x.name)
+  }));
+
+  allItems.sort((a,b)=>b.score-a.score);
+
+  document.getElementById("time").textContent=
+   new Date().toLocaleTimeString("zh-CN",{
+    hour:"2-digit",
+    minute:"2-digit"
+   });
+
+  status.innerHTML="";
+
+  render();
+
+ }catch(e){
+
+  status.innerHTML=
+   '<div class="error">❌ '+escapeHtml(e.message)+
+   '<br><br>如果扫描失败，请检查 Render 中的 APIFY_TOKEN。</div>';
+
+ }
 }
+
+function escapeHtml(s){
+ return String(s||"").replace(
+  /[&<>"']/g,
+  m=>({
+   "&":"&amp;",
+   "<":"&lt;",
+   ">":"&gt;",
+   '"':"&quot;",
+   "'":"&#039;"
+  }[m])
+ );
 }
-</script></body></html>`;
+
+function escapeAttr(s){
+ return String(s||"")
+  .replace(/&/g,"&amp;")
+  .replace(/"/g,"&quot;")
+  .replace(/</g,"&lt;")
+  .replace(/>/g,"&gt;");
+}
+
+function escapeJs(s){
+ return String(s||"")
+  .replace(/\\\\/g,"\\\\\\\\")
+  .replace(/'/g,"\\\\'");
+}
+
+</script>
+
+</body>
+</html>`;
 
 async function getTrends(woeid){
-if(!TOKEN)throw new Error("服务器还没有设置 APIFY_TOKEN");
-const url="https://api.apify.com/v2/acts/myagizm~x-trends-scraper/run-sync-get-dataset-items?token="+encodeURIComponent(TOKEN);
-const r=await fetch(url,{
-method:"POST",
-headers:{"Content-Type":"application/json"},
-body:JSON.stringify({woeid:Number(woeid),resultsLimit:50})
-});
-const text=await r.text();
-if(!r.ok)throw new Error("Apify 请求失败："+text.slice(0,300));
-try{
-let d=JSON.parse(text);
-return Array.isArray(d)?d:[];
-}catch(e){throw new Error("Apify 返回的数据无法解析")}
+
+ if(!APIFY_TOKEN){
+  throw new Error("服务器还没有设置 APIFY_TOKEN");
+ }
+
+ const api=
+ "https://api.apify.com/v2/acts/myagizm~x-trends-scraper/run-sync-get-dataset-items?token="+
+ encodeURIComponent(APIFY_TOKEN);
+
+ const response=await fetch(api,{
+  method:"POST",
+  headers:{
+   "Content-Type":"application/json"
+  },
+  body:JSON.stringify({
+   woeid:Number(woeid),
+   resultsLimit:50
+  })
+ });
+
+ const text=await response.text();
+
+ if(!response.ok){
+  throw new Error(
+   "Apify 请求失败："+text.slice(0,300)
+  );
+ }
+
+ try{
+  const data=JSON.parse(text);
+  return Array.isArray(data)?data:[];
+ }catch{
+  throw new Error("Apify 返回的数据无法解析");
+ }
 }
 
 const server=http.createServer(async(req,res)=>{
-try{
-const u=new URL(req.url,"http://localhost");
 
-if(u.pathname==="/api/trends"){
-const items=await getTrends(u.searchParams.get("woeid")||"1");
-res.writeHead(200,{"Content-Type":"application/json;charset=utf-8"});
-res.end(JSON.stringify({items}));
-return;
-}
+ try{
 
-if(u.pathname==="/"||u.pathname==="/index.html"){
-res.writeHead(200,{"Content-Type":"text/html;charset=utf-8"});
-res.end(html);
-return;
-}
+  const u=new URL(req.url,"http://localhost");
 
-res.writeHead(404,{"Content-Type":"text/plain;charset=utf-8"});
-res.end("Not found");
-}catch(e){
-res.writeHead(500,{"Content-Type":"application/json;charset=utf-8"});
-res.end(JSON.stringify({error:e.message}));
-}
+  if(u.pathname==="/api/trends"){
+
+   const woeid=u.searchParams.get("woeid")||"1";
+
+   const items=await getTrends(woeid);
+
+   res.writeHead(200,{
+    "Content-Type":"application/json; charset=utf-8"
+   });
+
+   res.end(JSON.stringify({items}));
+   return;
+  }
+
+  if(
+   u.pathname==="/" ||
+   u.pathname==="/index.html"
+  ){
+
+   res.writeHead(200,{
+    "Content-Type":"text/html; charset=utf-8"
+   });
+
+   res.end(html);
+   return;
+  }
+
+  res.writeHead(404,{
+   "Content-Type":"text/plain; charset=utf-8"
+  });
+
+  res.end("Not found");
+
+ }catch(e){
+
+  res.writeHead(500,{
+   "Content-Type":"application/json; charset=utf-8"
+  });
+
+  res.end(JSON.stringify({
+   error:e.message
+  }));
+ }
 });
 
 server.listen(PORT,"0.0.0.0",()=>{
-console.log("X热点起飞雷达运行中："+PORT);
+ console.log(
+  "X热点起飞雷达 V3 运行中，端口："+PORT
+ );
 });
